@@ -13,11 +13,10 @@ import numpy as np
 
 from smartglove_realtime import (
     HOST,
-    PACKET_SIZE,
     PORT,
     RATE_WINDOW_INTERVALS,
     calculate_packet_rate,
-    parse_packet,
+    parse_packet_with_error,
 )
 
 importlib.import_module("myosuite")
@@ -26,6 +25,7 @@ importlib.import_module("myosuite")
 ENV_NAME = "myoHandPoseFixed-v0"
 CALIBRATION_PACKETS = 30
 IK_ITERATIONS = 20
+FILTER_CUTOFF_HZ = 6.0
 # Couple the two flexion joints because one distal quaternion cannot resolve both.
 DISTAL_COUPLING = 2.0 / 3.0
 
@@ -39,6 +39,7 @@ FINGER_JOINTS = {
         ),
         "flexion_slots": (1, 2, 3),
         "body": "distal_thumb",
+        "flexion_closed_limit": "low",
     },
     "INDEX": {
         "joints": (
@@ -110,6 +111,95 @@ def quaternion_conjugate(quaternion: np.ndarray) -> np.ndarray:
     return quaternion * np.array((1.0, -1.0, -1.0, -1.0))
 
 
+def quaternion_relative(start: np.ndarray, current: np.ndarray) -> np.ndarray:
+    relative = normalize_quaternion(
+        quaternion_multiply(quaternion_conjugate(start), current)
+    )
+    return -relative if relative[0] < 0.0 else relative
+
+
+def quaternion_slerp(
+    start: np.ndarray,
+    target: np.ndarray,
+    amount: float,
+) -> np.ndarray:
+    start = normalize_quaternion(start)
+    target = normalize_quaternion(target)
+    dot = float(np.dot(start, target))
+
+    if dot < 0.0:
+        target = -target
+        dot = -dot
+
+    amount = float(np.clip(amount, 0.0, 1.0))
+    dot = float(np.clip(dot, -1.0, 1.0))
+    if dot > 0.9995:
+        return normalize_quaternion(start + amount * (target - start))
+
+    angle = math.acos(dot)
+    sin_angle = math.sin(angle)
+    start_weight = math.sin((1.0 - amount) * angle) / sin_angle
+    target_weight = math.sin(amount * angle) / sin_angle
+    return normalize_quaternion(start_weight * start + target_weight * target)
+
+
+class QuaternionLowPassFilter:
+    def __init__(self, cutoff_hz: float = FILTER_CUTOFF_HZ) -> None:
+        if not math.isfinite(cutoff_hz) or cutoff_hz <= 0.0:
+            raise ValueError("filter_cutoff_hz harus finite dan lebih besar dari nol.")
+        self.cutoff_hz = cutoff_hz
+        self.filtered: dict[str, np.ndarray] = {}
+        self.last_time: float | None = None
+
+    def reset(
+        self,
+        orientations: dict[str, np.ndarray],
+        timestamp: float,
+    ) -> None:
+        self.filtered = {
+            finger: normalize_quaternion(orientation)
+            for finger, orientation in orientations.items()
+        }
+        self.last_time = timestamp
+
+    def update(
+        self,
+        orientations: dict[str, np.ndarray],
+        timestamp: float,
+    ) -> dict[str, np.ndarray]:
+        if self.last_time is None:
+            self.reset(orientations, timestamp)
+            return {finger: value.copy() for finger, value in self.filtered.items()}
+
+        elapsed = max(0.0, timestamp - self.last_time)
+        amount = -math.expm1(-2.0 * math.pi * self.cutoff_hz * elapsed)
+        for finger, orientation in orientations.items():
+            normalized = normalize_quaternion(orientation)
+            previous = self.filtered.get(finger)
+            self.filtered[finger] = (
+                normalized
+                if previous is None
+                else quaternion_slerp(previous, normalized, amount)
+            )
+
+        self.last_time = timestamp
+        return {finger: value.copy() for finger, value in self.filtered.items()}
+
+
+def drain_udp_queue(sock: socket.socket) -> bytes | None:
+    latest_packet = None
+    sock.setblocking(False)
+    try:
+        while True:
+            try:
+                latest_packet, _ = sock.recvfrom(65535)
+            except BlockingIOError:
+                break
+    finally:
+        sock.settimeout(0.01)
+    return latest_packet
+
+
 def quaternion_error(target: np.ndarray, current: np.ndarray) -> np.ndarray:
     error = normalize_quaternion(
         quaternion_multiply(target, quaternion_conjugate(current))
@@ -149,7 +239,7 @@ def sensor_quaternion_to_wxyz(
 
 
 class HandQposMapper:
-    def __init__(self, model, data, flexion_gain: float = 3.0) -> None:
+    def __init__(self, model, data, flexion_gain: float = 1.0) -> None:
         if not math.isfinite(flexion_gain) or flexion_gain <= 0.0:
             raise ValueError("flexion_gain harus finite dan lebih besar dari nol.")
         self.model = model
@@ -169,6 +259,9 @@ class HandQposMapper:
                 "dof": [int(model.jnt_dofadr[joint_id]) for joint_id in joint_ids],
                 "joint_ids": joint_ids,
                 "flexion_slots": specification["flexion_slots"],
+                "flexion_closed_limit": specification.get(
+                    "flexion_closed_limit", "high"
+                ),
                 "body": self._name_id(
                     mujoco.mjtObj.mjOBJ_BODY,  # type: ignore[attr-defined]
                     specification["body"],
@@ -184,6 +277,8 @@ class HandQposMapper:
             }
 
         self.sensor_to_model = None
+        self.sensor_open = None
+        self.flexion_calibration = None
 
     def _name_id(self, object_type, name: str) -> int:
         object_id = mujoco.mj_name2id(self.model, object_type, name)  # type: ignore[attr-defined]
@@ -193,6 +288,11 @@ class HandQposMapper:
 
     def calibrate(self, sensor_neutral: dict[str, np.ndarray]) -> None:
         self.sensor_to_model = {}
+        self.sensor_open = {
+            finger: normalize_quaternion(quaternion)
+            for finger, quaternion in sensor_neutral.items()
+        }
+        self.flexion_calibration = None
         for finger, sensor_quaternion in sensor_neutral.items():
             model_quaternion = self.fingers[finger]["neutral_orientation"]
             self.sensor_to_model[finger] = normalize_quaternion(
@@ -201,6 +301,54 @@ class HandQposMapper:
                     quaternion_conjugate(sensor_quaternion),
                 )
             )
+
+    def calibrate_grip(self, sensor_grip: dict[str, np.ndarray]) -> list[str]:
+        if self.sensor_to_model is None or self.sensor_open is None:
+            raise RuntimeError("Kalibrasi pose terbuka harus dilakukan lebih dulu.")
+
+        calibration = {}
+        skipped_fingers = []
+        for finger, sensor_quaternion in sensor_grip.items():
+            relative = quaternion_relative(
+                self.sensor_open[finger], sensor_quaternion
+            )
+            axis_magnitude = float(np.linalg.norm(relative[1:]))
+            closed_angle = 2.0 * math.atan2(axis_magnitude, float(relative[0]))
+            if closed_angle < math.radians(5.0):
+                calibration[finger] = None
+                skipped_fingers.append(finger)
+                continue
+            closure_axis = relative[1:] / axis_magnitude
+
+            finger_data = self.fingers[finger]
+            finger_calibration = {}
+            for slot in finger_data["flexion_slots"]:
+                qpos_id = finger_data["qpos"][slot]
+                joint_id = finger_data["joint_ids"][slot]
+                if not self.model.jnt_limited[joint_id]:
+                    raise ValueError(
+                        f"Joint {finger} slot {slot} tidak memiliki batas sudut."
+                    )
+                low, high = self.model.jnt_range[joint_id]
+                target_closed = (
+                    low
+                    if finger_data["flexion_closed_limit"] == "low"
+                    else high
+                )
+                finger_calibration[qpos_id] = (
+                    float(self.neutral_qpos[qpos_id]),
+                    float(target_closed),
+                    joint_id,
+                )
+            calibration[finger] = (closure_axis, closed_angle, finger_calibration)
+
+        if len(skipped_fingers) == len(sensor_grip):
+            raise ValueError(
+                "Tidak ada jari yang menunjukkan perubahan cukup antara pose "
+                "terbuka dan genggam."
+            )
+        self.flexion_calibration = calibration
+        return skipped_fingers
 
     def _bounds(self, finger_data: dict) -> tuple[np.ndarray, np.ndarray]:
         lower = np.full(3, -np.inf)
@@ -312,7 +460,34 @@ class HandQposMapper:
 
         fitted_qpos = self.data.qpos.copy()
 
-        if self.flexion_gain != 1.0:
+        if self.flexion_calibration is not None:
+            if self.sensor_open is None:
+                raise RuntimeError("Pose terbuka belum dikalibrasi.")
+            for finger, finger_calibration_data in self.flexion_calibration.items():
+                if finger_calibration_data is None:
+                    continue
+                closure_axis, closed_angle, finger_calibration = (
+                    finger_calibration_data
+                )
+                relative = quaternion_relative(
+                    self.sensor_open[finger], sensor_quaternions[finger]
+                )
+                progress_angle = 2.0 * math.atan2(
+                    float(np.dot(relative[1:], closure_axis)),
+                    float(relative[0]),
+                )
+                progress = float(
+                    np.clip(
+                        progress_angle / closed_angle,
+                        0.0,
+                        1.0,
+                    )
+                )
+                for qpos_id, (target_open, target_closed, joint_id) in finger_calibration.items():
+                    value = target_open + progress * self.flexion_gain * (target_closed - target_open)
+                    low, high = self.model.jnt_range[joint_id]
+                    self.data.qpos[qpos_id] = float(np.clip(value, low, high))
+        elif self.flexion_gain != 1.0:
             for finger_data in self.fingers.values():
                 for slot in finger_data["flexion_slots"]:
                     joint_id = finger_data["joint_ids"][slot]
@@ -337,7 +512,11 @@ def capture_sensor_quaternions(parsed: dict, order: str) -> dict[str, np.ndarray
     }
 
 
-def run(quaternion_order: str, flexion_gain: float) -> None:
+def run(
+    quaternion_order: str,
+    flexion_gain: float,
+    filter_cutoff_hz: float,
+) -> None:
     env = gym.make(ENV_NAME)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -348,9 +527,11 @@ def run(quaternion_order: str, flexion_gain: float) -> None:
         data.qvel[:] = 0.0
         mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
         mapper = HandQposMapper(model, data, flexion_gain)
+        quaternion_filter = QuaternionLowPassFilter(filter_cutoff_hz)
 
         print(f"[OK] MyoSuite model : {ENV_NAME} (nq={model.nq})")
         print(f"[OK] Flexion gain  : {flexion_gain:.2f}x")
+        print(f"[OK] Filter cutoff : {filter_cutoff_hz:.1f} Hz")
         print(
             "Atur glove ke pose netral yang ingin dianggap sebagai tangan terbuka: "
             "jari lurus, ibu jari terbuka, pergelangan rileks."
@@ -368,11 +549,13 @@ def run(quaternion_order: str, flexion_gain: float) -> None:
         )
 
         calibration_samples = {finger: [] for finger in FINGER_JOINTS}
+        grip_calibration_samples = {finger: [] for finger in FINGER_JOINTS}
         packet_intervals = deque(maxlen=RATE_WINDOW_INTERVALS)
         last_packet_time = None
         frame_number = 0
         last_status_time = 0.0
         calibrated = False
+        grip_calibrated = False
 
         with mujoco.viewer.launch_passive(model, data) as viewer:
             while viewer.is_running():
@@ -382,12 +565,15 @@ def run(quaternion_order: str, flexion_gain: float) -> None:
                     viewer.sync()
                     continue
 
+                latest_packet = drain_udp_queue(sock)
+                if latest_packet is not None:
+                    packet = latest_packet
+
                 now = time.perf_counter()
-                parsed = parse_packet(packet)
+                parsed, parse_error = parse_packet_with_error(packet)
                 if parsed is None:
                     print(
-                        f"[WARNING] Paket diabaikan: {len(packet)} bytes "
-                        f"(diharapkan {PACKET_SIZE})"
+                        f"[WARNING] Paket diabaikan: {parse_error}"
                     )
                     continue
 
@@ -418,9 +604,65 @@ def run(quaternion_order: str, flexion_gain: float) -> None:
                         for finger, samples in calibration_samples.items()
                     }
                     mapper.calibrate(sensor_neutral)
+                    quaternion_filter.reset(sensor_neutral, now)
                     calibrated = True
-                    print("\n[OK] Kalibrasi selesai. Menggerakkan model...")
+                    print("\n[OK] Pose terbuka tersimpan.")
+                    input(
+                        "Sekarang genggam tangan dengan nyaman, tahan posisi, "
+                        "lalu tekan Enter untuk kalibrasi genggaman..."
+                    )
+                    drain_udp_queue(sock)
+                    last_status_time = 0.0
+                    continue
 
+                if not grip_calibrated:
+                    for finger, quaternion in sensor_quaternions.items():
+                        grip_calibration_samples[finger].append(quaternion)
+
+                    sample_count = len(grip_calibration_samples["THUMB"])
+                    if sample_count < CALIBRATION_PACKETS:
+                        if now - last_status_time >= 0.5:
+                            print(
+                                f"[CALIBRATION GRIP] {sample_count}/"
+                                f"{CALIBRATION_PACKETS} paket genggam",
+                                end="\r",
+                            )
+                            last_status_time = now
+                        viewer.sync()
+                        continue
+
+                    sensor_grip = {
+                        finger: average_quaternions(samples)
+                        for finger, samples in grip_calibration_samples.items()
+                    }
+                    try:
+                        skipped_fingers = mapper.calibrate_grip(sensor_grip)
+                    except ValueError as error:
+                        print(f"\n[WARNING] Kalibrasi genggam gagal: {error}")
+                        input(
+                            "Atur ulang genggaman, tahan, lalu tekan Enter "
+                            "untuk mencoba lagi..."
+                        )
+                        drain_udp_queue(sock)
+                        grip_calibration_samples = {
+                            finger: [] for finger in FINGER_JOINTS
+                        }
+                        last_status_time = 0.0
+                        continue
+
+                    for finger in skipped_fingers:
+                        print(
+                            f"[WARNING] Kalibrasi genggam {finger} tidak menangkap "
+                            "perubahan; jari ini tetap menggunakan IK."
+                        )
+                    quaternion_filter.reset(sensor_grip, now)
+                    grip_calibrated = True
+                    print("\n[OK] Kalibrasi terbuka dan genggam selesai.")
+
+                sensor_quaternions = quaternion_filter.update(
+                    sensor_quaternions,
+                    now,
+                )
                 qpos = mapper.map_frame(sensor_quaternions)
 
                 if last_packet_time is not None:
@@ -464,13 +706,21 @@ def main() -> None:
     parser.add_argument(
         "--flexion-gain",
         type=float,
-        default=3.0,
-        help="Pengali fleksi jari (default: 3.0; nilai 1.0 menonaktifkannya).",
+        default=1.0,
+        help="Pengali fleksi jari (default: 1.0).",
+    )
+    parser.add_argument(
+        "--filter-cutoff-hz",
+        type=float,
+        default=FILTER_CUTOFF_HZ,
+        help="Cutoff filter quaternion dalam Hz; lebih rendah lebih halus (default: 6).",
     )
     args = parser.parse_args()
     if not math.isfinite(args.flexion_gain) or args.flexion_gain <= 0.0:
         parser.error("--flexion-gain harus finite dan lebih besar dari nol.")
-    run(args.quaternion_order, args.flexion_gain)
+    if not math.isfinite(args.filter_cutoff_hz) or args.filter_cutoff_hz <= 0.0:
+        parser.error("--filter-cutoff-hz harus finite dan lebih besar dari nol.")
+    run(args.quaternion_order, args.flexion_gain, args.filter_cutoff_hz)
 
 
 if __name__ == "__main__":

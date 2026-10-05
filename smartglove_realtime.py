@@ -31,6 +31,19 @@ FINGERS = {
     "PINKY":  0xA8,
 }
 
+FINGER_IDS = {
+    "THUMB": 0x00000000,
+    "INDEX": 0x00000100,
+    "MIDDLE": 0x00000200,
+    "RING": 0x00000300,
+    "PINKY": 0x00000400,
+}
+
+FINGER_ID_ALIASES = {
+    0x03010000: "THUMB",
+    0x00010200: "MIDDLE",
+}
+
 
 # ============================================================
 # PARSER
@@ -81,20 +94,46 @@ def parse_packet(data):
     Parse the 624-byte Smartglove UDP packet.
     """
 
-    if len(data) != PACKET_SIZE:
-        return None
+    parsed, _ = parse_packet_with_error(data)
+    return parsed
 
+
+def parse_packet_with_error(data):
+    """Parse a packet and return a reason when its contents are invalid."""
+    if len(data) != PACKET_SIZE:
+        return None, f"ukuran {len(data)} bytes (diharapkan {PACKET_SIZE})"
+
+    finger_by_id = {finger_id: finger for finger, finger_id in FINGER_IDS.items()}
+    finger_by_id.update(FINGER_ID_ALIASES)
     result = {}
 
-    for finger, offset in FINGERS.items():
+    for offset in FINGERS.values():
         parsed = parse_finger(data, offset)
 
         if parsed is None:
-            return None
+            finger_id = struct.unpack_from("<I", data, offset)[0]
+            return None, (
+                f"quaternion tidak valid pada record offset 0x{offset:02X} "
+                f"(ID 0x{finger_id:08X})"
+            )
+
+        finger = finger_by_id.get(parsed["id"])
+        if finger is None:
+            return None, (
+                f"ID jari tidak dikenal 0x{parsed['id']:08X} "
+                f"pada record offset 0x{offset:02X}"
+            )
+        if finger in result:
+            return None, (
+                f"ID jari {finger} duplikat pada record offset 0x{offset:02X}"
+            )
 
         result[finger] = parsed
 
-    return result
+    if len(result) != len(FINGER_IDS):
+        missing = sorted(set(FINGER_IDS) - result.keys())
+        return None, f"record jari tidak ditemukan: {', '.join(missing)}"
+    return result, None
 
 
 def calculate_packet_rate(intervals):
