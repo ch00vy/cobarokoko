@@ -11,6 +11,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
+from control.smartglove_muscle_control import SmartGloveMuscleController
 from smartglove_realtime import (
     HOST,
     PORT,
@@ -25,7 +26,7 @@ importlib.import_module("myosuite")
 ENV_NAME = "myoHandPoseFixed-v0"
 CALIBRATION_PACKETS = 30
 IK_ITERATIONS = 20
-FILTER_CUTOFF_HZ = 6.0
+FILTER_CUTOFF_HZ = 12.0
 # Couple the two flexion joints because one distal quaternion cannot resolve both.
 DISTAL_COUPLING = 2.0 / 3.0
 
@@ -40,6 +41,7 @@ FINGER_JOINTS = {
         "flexion_slots": (1, 2, 3),
         "body": "distal_thumb",
         "flexion_closed_limit": "low",
+        "invert_abduction": True,
     },
     "INDEX": {
         "joints": (
@@ -239,7 +241,13 @@ def sensor_quaternion_to_wxyz(
 
 
 class HandQposMapper:
-    def __init__(self, model, data, flexion_gain: float = 1.0) -> None:
+    def __init__(
+        self,
+        model,
+        data,
+        flexion_gain: float = 1.0,
+        invert_thumb_abduction: bool = False,
+    ) -> None:
         if not math.isfinite(flexion_gain) or flexion_gain <= 0.0:
             raise ValueError("flexion_gain harus finite dan lebih besar dari nol.")
         self.model = model
@@ -262,6 +270,10 @@ class HandQposMapper:
                 "flexion_closed_limit": specification.get(
                     "flexion_closed_limit", "high"
                 ),
+                "invert_abduction": specification.get(
+                    "invert_abduction", False
+                )
+                and (finger != "THUMB" or invert_thumb_abduction),
                 "body": self._name_id(
                     mujoco.mjtObj.mjOBJ_BODY,  # type: ignore[attr-defined]
                     specification["body"],
@@ -452,11 +464,22 @@ class HandQposMapper:
                     for index in range(3)
                 ]
             )
+            if finger_data["invert_abduction"]:
+                initial_variables[0] *= -1.0
             self._fit_finger(
                 finger_data,
                 target_orientation,
                 initial_variables,
             )
+            if finger_data["invert_abduction"]:
+                abduction_qpos = qpos_ids[0]
+                neutral = self.neutral_qpos[abduction_qpos]
+                value = 2.0 * neutral - self.data.qpos[abduction_qpos]
+                joint_id = finger_data["joint_ids"][0]
+                if self.model.jnt_limited[joint_id]:
+                    low, high = self.model.jnt_range[joint_id]
+                    value = float(np.clip(value, low, high))
+                self.data.qpos[abduction_qpos] = value
 
         fitted_qpos = self.data.qpos.copy()
 
@@ -527,9 +550,15 @@ def run(
         data.qvel[:] = 0.0
         mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
         mapper = HandQposMapper(model, data, flexion_gain)
+        muscle_controller = SmartGloveMuscleController(
+            model,
+            data,
+            FINGER_JOINTS,
+        )
         quaternion_filter = QuaternionLowPassFilter(filter_cutoff_hz)
 
         print(f"[OK] MyoSuite model : {ENV_NAME} (nq={model.nq})")
+        print(f"[OK] Muscle control: {model.nu} actuator aktif di viewer")
         print(f"[OK] Flexion gain  : {flexion_gain:.2f}x")
         print(f"[OK] Filter cutoff : {filter_cutoff_hz:.1f} Hz")
         print(
@@ -664,6 +693,7 @@ def run(
                     now,
                 )
                 qpos = mapper.map_frame(sensor_quaternions)
+                muscle_controller.update(qpos)
 
                 if last_packet_time is not None:
                     interval = now - last_packet_time
@@ -688,6 +718,8 @@ def run(
                     last_status_time = now
 
                 viewer.sync()
+    except KeyboardInterrupt:
+        print("\n[STOP] Smartglove MuJoCo dihentikan.")
     finally:
         sock.close()
         env.close()
@@ -713,7 +745,7 @@ def main() -> None:
         "--filter-cutoff-hz",
         type=float,
         default=FILTER_CUTOFF_HZ,
-        help="Cutoff filter quaternion dalam Hz; lebih rendah lebih halus (default: 6).",
+        help="Cutoff filter quaternion dalam Hz; lebih rendah lebih halus (default: 12).",
     )
     args = parser.parse_args()
     if not math.isfinite(args.flexion_gain) or args.flexion_gain <= 0.0:
