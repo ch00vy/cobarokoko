@@ -25,17 +25,23 @@ importlib.import_module("myosuite")
 
 from GUI.full_viewer_worker import run_full_viewer
 from control.smartglove_muscle_control import SmartGloveMuscleController
-from smartglove_mujoco import (
+from fatigue import MyoSuiteFatigue
+from smartglove.config import (
     CALIBRATION_PACKETS,
     ENV_NAME,
     FINGER_JOINTS,
-    HandQposMapper,
+)
+from smartglove.mapping import HandQposMapper
+from smartglove.quaternion import (
     QuaternionLowPassFilter,
     average_quaternions,
-    calculate_packet_rate,
-    capture_sensor_quaternions,
 )
-from smartglove_realtime import RATE_WINDOW_INTERVALS, parse_packet_with_error
+from smartglove.runtime import capture_sensor_quaternions
+from smartglove_realtime import (
+    RATE_WINDOW_INTERVALS,
+    calculate_packet_rate,
+    parse_packet_with_error,
+)
 
 
 RECORDINGS_DIR = Path(__file__).resolve().parent / "recordings"
@@ -55,6 +61,7 @@ class SmartGloveGUI:
         self.data: Any = None
         self.mapper: HandQposMapper | None = None
         self.muscle_controller: SmartGloveMuscleController | None = None
+        self.fatigue_model: MyoSuiteFatigue | None = None
         self.quaternion_filter: QuaternionLowPassFilter | None = None
         self.full_viewer_process: Any = None
         self.full_viewer_state_queue: Any = None
@@ -91,6 +98,7 @@ class SmartGloveGUI:
         self.guidance_var = tk.StringVar(
             value="Connect to open the model and listen for glove data."
         )
+        self.fatigue_enabled = False
         self.fds_vars = {name: tk.StringVar(value="0.000") for name in FDS_NAMES}
 
         self._build_ui()
@@ -182,7 +190,34 @@ class SmartGloveGUI:
         self._build_preview_panel()
 
     def _build_connection_panel(self) -> None:
-        panel = self.left_panel
+        self.connection_canvas = tk.Canvas(
+            self.left_panel,
+            background="#19212b",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            self.left_panel,
+            orient="vertical",
+            command=self.connection_canvas.yview,
+        )
+        self.connection_canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.connection_canvas.pack(side="left", fill="both", expand=True)
+
+        panel = ttk.Frame(self.connection_canvas, padding=14)
+        self.connection_window = self.connection_canvas.create_window(
+            (0, 0),
+            window=panel,
+            anchor="nw",
+        )
+        panel.bind("<Configure>", self._update_connection_scrollregion)
+        self.connection_canvas.bind("<Configure>", self._resize_connection_content)
+        self.mousewheel_binding = self.root.bind_all(
+            "<MouseWheel>",
+            self._scroll_connection_panel,
+        )
+
         ttk.Label(panel, text="Connection", style="Section.TLabel").pack(
             anchor="w"
         )
@@ -235,6 +270,13 @@ class SmartGloveGUI:
             state="disabled",
         )
         self.stop_record_button.pack(fill="x", pady=(0, 10))
+        self.fatigue_button = ttk.Button(
+            panel,
+            text="Fatigue: OFF",
+            command=self._toggle_fatigue,
+            state="disabled",
+        )
+        self.fatigue_button.pack(fill="x", pady=(0, 10))
 
         ttk.Separator(panel).pack(fill="x", pady=4)
         self._status_row(panel, "Status", self.connection_var)
@@ -258,6 +300,32 @@ class SmartGloveGUI:
             justify="left",
         )
         self.guidance_label.pack(anchor="w", fill="x", pady=(12, 0))
+
+    def _update_connection_scrollregion(self, _event: tk.Event) -> None:
+        self.connection_canvas.configure(
+            scrollregion=self.connection_canvas.bbox("all")
+        )
+
+    def _resize_connection_content(self, event: tk.Event) -> None:
+        self.connection_canvas.itemconfigure(
+            self.connection_window,
+            width=event.width,
+        )
+
+    def _scroll_connection_panel(self, event: tk.Event) -> None:
+        canvas_top = self.connection_canvas.winfo_rooty()
+        canvas_bottom = canvas_top + self.connection_canvas.winfo_height()
+        canvas_left = self.connection_canvas.winfo_rootx()
+        canvas_right = canvas_left + self.connection_canvas.winfo_width()
+        if not (
+            canvas_left <= event.x_root < canvas_right
+            and canvas_top <= event.y_root < canvas_bottom
+        ):
+            return
+        self.connection_canvas.yview_scroll(
+            -1 if event.delta > 0 else 1,
+            "units",
+        )
 
     @staticmethod
     def _add_field(parent: ttk.Frame, label: str, variable: tk.StringVar) -> None:
@@ -363,6 +431,12 @@ class SmartGloveGUI:
                 self.data,
                 FINGER_JOINTS,
             )
+            self.fatigue_model = MyoSuiteFatigue(
+                self.model,
+                time.perf_counter(),
+            )
+            self.fatigue_enabled = False
+            self.fatigue_button.configure(text="Fatigue: OFF", state="disabled")
             self.fds_indices = {
                 name: self.muscle_controller.actuator_names.index(name)
                 for name in FDS_NAMES
@@ -438,6 +512,8 @@ class SmartGloveGUI:
         self.full_viewer_button.configure(state="disabled", text="Open full viewer")
         self.grip_button.configure(state="disabled")
         self.record_button.configure(state="disabled")
+        self.fatigue_enabled = False
+        self.fatigue_button.configure(text="Fatigue: OFF", state="disabled")
         self._update_fds_labels()
 
     def _release_resources(self) -> None:
@@ -452,7 +528,23 @@ class SmartGloveGUI:
         self.data = None
         self.mapper = None
         self.muscle_controller = None
+        self.fatigue_model = None
         self.quaternion_filter = None
+
+    def _toggle_fatigue(self) -> None:
+        if self.fatigue_model is None or self.phase != "running":
+            return
+        self.fatigue_enabled = not self.fatigue_enabled
+        self.fatigue_model.set_enabled(
+            self.fatigue_enabled,
+            time.perf_counter(),
+        )
+        state = "ON" if self.fatigue_enabled else "OFF"
+        self.fatigue_button.configure(text=f"Fatigue: {state}")
+        self.guidance_var.set(
+            f"Model fatigue 3CC-r {state}. "
+            "Efek fatigue mengubah aktivasi otot; pose saat ini tetap mengikuti glove."
+        )
 
     def _start_grip_calibration(self) -> None:
         if self.phase != "await_grip":
@@ -730,6 +822,7 @@ class SmartGloveGUI:
                 + skipped
             )
             self.record_button.configure(state="normal")
+            self.fatigue_button.configure(state="normal")
             self.full_viewer_button.configure(state="normal")
             self._toggle_full_viewer()
             return
@@ -739,7 +832,13 @@ class SmartGloveGUI:
 
         filtered = self.quaternion_filter.update(sensor_quaternions, timestamp)
         qpos = self.mapper.map_frame(filtered)
-        self.muscle_controller.update(qpos)
+        target_activations = self.muscle_controller.update(qpos)
+        if self.fatigue_model is None:
+            raise RuntimeError("Model fatigue belum siap.")
+        self.data.ctrl[:] = self.fatigue_model.update(
+            target_activations,
+            timestamp,
+        )
         self.latest_fds = {
             name: float(self.data.ctrl[self.fds_indices[name]])
             for name in FDS_NAMES
@@ -837,6 +936,12 @@ class SmartGloveGUI:
     def _close(self) -> None:
         self._stop_recording()
         self._release_resources()
+        if self.mousewheel_binding is not None:
+            self.root.unbind_class(
+                "all",
+                "<MouseWheel>",
+                self.mousewheel_binding,
+            )
         self.root.destroy()
 
 
