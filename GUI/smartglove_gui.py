@@ -89,7 +89,7 @@ class SmartGloveGUI:
         self.preview_image = None
         self.latest_fds = dict.fromkeys(FDS_NAMES, 0.0)
 
-        self.host_var = tk.StringVar(value="0.0.0.0")
+        self.host_var = tk.StringVar(value="192.168.3.101")
         self.port_var = tk.StringVar(value="14041")
         self.subject_var = tk.StringVar(value="subject_smart_glove")
         self.connection_var = tk.StringVar(value="Disconnected")
