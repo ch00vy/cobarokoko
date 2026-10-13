@@ -16,6 +16,7 @@ from smartglove.quaternion import (
     average_quaternions,
     sensor_quaternion_to_wxyz,
 )
+from smartglove.wrist_mapping import WristQposMapper
 from smartglove_realtime import (
     HOST,
     PORT,
@@ -63,6 +64,7 @@ def run(
         data.qvel[:] = 0.0
         mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
         mapper = HandQposMapper(model, data, flexion_gain)
+        wrist_mapper = WristQposMapper(model, data)
         muscle_controller = SmartGloveMuscleController(
             model,
             data,
@@ -91,6 +93,9 @@ def run(
         )
 
         calibration_samples = {finger: [] for finger in FINGER_JOINTS}
+        wrist_calibration_samples = {
+            sensor: [] for sensor in ("FOREARM", "HAND")
+        }
         grip_calibration_samples = {finger: [] for finger in FINGER_JOINTS}
         packet_intervals = deque(maxlen=RATE_WINDOW_INTERVALS)
         last_packet_time = None
@@ -127,7 +132,10 @@ def run(
 
                 if not calibrated:
                     for finger, quaternion in sensor_quaternions.items():
-                        calibration_samples[finger].append(quaternion)
+                        if finger in calibration_samples:
+                            calibration_samples[finger].append(quaternion)
+                        elif finger in wrist_calibration_samples:
+                            wrist_calibration_samples[finger].append(quaternion)
 
                     sample_count = len(calibration_samples["THUMB"])
                     if sample_count < CALIBRATION_PACKETS:
@@ -146,7 +154,18 @@ def run(
                         for finger, samples in calibration_samples.items()
                     }
                     mapper.calibrate(sensor_neutral)
-                    quaternion_filter.reset(sensor_neutral, now)
+                    sensor_wrist_neutral = {
+                        sensor: average_quaternions(samples)
+                        for sensor, samples in wrist_calibration_samples.items()
+                    }
+                    wrist_mapper.calibrate(
+                        sensor_wrist_neutral["FOREARM"],
+                        sensor_wrist_neutral["HAND"],
+                    )
+                    quaternion_filter.reset(
+                        {**sensor_neutral, **sensor_wrist_neutral},
+                        now,
+                    )
                     calibrated = True
                     print("\n[OK] Pose terbuka tersimpan.")
                     input(
@@ -159,7 +178,8 @@ def run(
 
                 if not grip_calibrated:
                     for finger, quaternion in sensor_quaternions.items():
-                        grip_calibration_samples[finger].append(quaternion)
+                        if finger in grip_calibration_samples:
+                            grip_calibration_samples[finger].append(quaternion)
 
                     sample_count = len(grip_calibration_samples["THUMB"])
                     if sample_count < CALIBRATION_PACKETS:
@@ -197,7 +217,7 @@ def run(
                             f"[WARNING] Kalibrasi genggam {finger} tidak menangkap "
                             "perubahan; jari ini tetap menggunakan IK."
                         )
-                    quaternion_filter.reset(sensor_grip, now)
+                    quaternion_filter.reset(sensor_quaternions, now)
                     grip_calibrated = True
                     print("\n[OK] Kalibrasi terbuka dan genggam selesai.")
 
@@ -205,7 +225,12 @@ def run(
                     sensor_quaternions,
                     now,
                 )
-                qpos = mapper.map_frame(sensor_quaternions)
+                finger_quaternions = {
+                    finger: sensor_quaternions[finger]
+                    for finger in FINGER_JOINTS
+                }
+                qpos = mapper.map_frame(finger_quaternions)
+                qpos = wrist_mapper.map_frame(sensor_quaternions)
                 muscle_controller.update(qpos)
 
                 if last_packet_time is not None:

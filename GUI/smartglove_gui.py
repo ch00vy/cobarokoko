@@ -37,6 +37,7 @@ from smartglove.quaternion import (
     average_quaternions,
 )
 from smartglove.runtime import capture_sensor_quaternions
+from smartglove.wrist_mapping import WristQposMapper
 from smartglove_realtime import (
     RATE_WINDOW_INTERVALS,
     calculate_packet_rate,
@@ -60,6 +61,7 @@ class SmartGloveGUI:
         self.model: Any = None
         self.data: Any = None
         self.mapper: HandQposMapper | None = None
+        self.wrist_mapper: WristQposMapper | None = None
         self.muscle_controller: SmartGloveMuscleController | None = None
         self.fatigue_model: MyoSuiteFatigue | None = None
         self.quaternion_filter: QuaternionLowPassFilter | None = None
@@ -213,7 +215,7 @@ class SmartGloveGUI:
         )
         panel.bind("<Configure>", self._update_connection_scrollregion)
         self.connection_canvas.bind("<Configure>", self._resize_connection_content)
-        self.mousewheel_binding = self.root.bind_all(
+        self.root.bind_all(
             "<MouseWheel>",
             self._scroll_connection_panel,
         )
@@ -426,6 +428,7 @@ class SmartGloveGUI:
                 self.data,
                 invert_thumb_abduction=True,
             )
+            self.wrist_mapper = WristQposMapper(self.model, self.data)
             self.muscle_controller = SmartGloveMuscleController(
                 self.model,
                 self.data,
@@ -468,6 +471,9 @@ class SmartGloveGUI:
             self.last_datagram_time = None
             self.udp_receive_count = 0
             self.calibration_samples = {finger: [] for finger in FINGER_JOINTS}
+            self.wrist_calibration_samples = {
+                sensor: [] for sensor in ("FOREARM", "HAND")
+            }
             self.grip_calibration_samples = {
                 finger: [] for finger in FINGER_JOINTS
             }
@@ -527,6 +533,7 @@ class SmartGloveGUI:
         self.model = None
         self.data = None
         self.mapper = None
+        self.wrist_mapper = None
         self.muscle_controller = None
         self.fatigue_model = None
         self.quaternion_filter = None
@@ -769,7 +776,10 @@ class SmartGloveGUI:
         sensor_quaternions = capture_sensor_quaternions(parsed, "xyzw")
         if self.phase == "neutral":
             for finger, quaternion in sensor_quaternions.items():
-                self.calibration_samples[finger].append(quaternion)
+                if finger in self.calibration_samples:
+                    self.calibration_samples[finger].append(quaternion)
+                elif finger in self.wrist_calibration_samples:
+                    self.wrist_calibration_samples[finger].append(quaternion)
             sample_count = len(self.calibration_samples["THUMB"])
             self.qpos_var.set(f"Open pose {sample_count}/{CALIBRATION_PACKETS}")
             if sample_count >= CALIBRATION_PACKETS:
@@ -777,8 +787,21 @@ class SmartGloveGUI:
                     finger: average_quaternions(samples)
                     for finger, samples in self.calibration_samples.items()
                 }
+                sensor_wrist_neutral = {
+                    sensor: average_quaternions(samples)
+                    for sensor, samples in self.wrist_calibration_samples.items()
+                }
+                if self.wrist_mapper is None:
+                    raise RuntimeError("Mapper pergelangan belum siap.")
                 self.mapper.calibrate(sensor_neutral)
-                self.quaternion_filter.reset(sensor_neutral, timestamp)
+                self.wrist_mapper.calibrate(
+                    sensor_wrist_neutral["FOREARM"],
+                    sensor_wrist_neutral["HAND"],
+                )
+                self.quaternion_filter.reset(
+                    {**sensor_neutral, **sensor_wrist_neutral},
+                    timestamp,
+                )
                 self.phase = "await_grip"
                 self.qpos_var.set("Open pose ready")
                 self.guidance_var.set(
@@ -790,7 +813,8 @@ class SmartGloveGUI:
 
         if self.phase == "grip":
             for finger, quaternion in sensor_quaternions.items():
-                self.grip_calibration_samples[finger].append(quaternion)
+                if finger in self.grip_calibration_samples:
+                    self.grip_calibration_samples[finger].append(quaternion)
             sample_count = len(self.grip_calibration_samples["THUMB"])
             self.qpos_var.set(f"Grip pose {sample_count}/{CALIBRATION_PACKETS}")
             if sample_count < CALIBRATION_PACKETS:
@@ -809,7 +833,7 @@ class SmartGloveGUI:
                 )
                 self.grip_button.configure(state="normal")
                 return
-            self.quaternion_filter.reset(sensor_grip, timestamp)
+            self.quaternion_filter.reset(sensor_quaternions, timestamp)
             self.phase = "running"
             skipped = (
                 f" IK dipakai untuk jari: {', '.join(skipped_fingers)}."
@@ -831,7 +855,13 @@ class SmartGloveGUI:
             return
 
         filtered = self.quaternion_filter.update(sensor_quaternions, timestamp)
-        qpos = self.mapper.map_frame(filtered)
+        finger_quaternions = {
+            finger: filtered[finger] for finger in FINGER_JOINTS
+        }
+        qpos = self.mapper.map_frame(finger_quaternions)
+        if self.wrist_mapper is None:
+            raise RuntimeError("Mapper pergelangan belum siap.")
+        qpos = self.wrist_mapper.map_frame(filtered)
         target_activations = self.muscle_controller.update(qpos)
         if self.fatigue_model is None:
             raise RuntimeError("Model fatigue belum siap.")
@@ -936,12 +966,7 @@ class SmartGloveGUI:
     def _close(self) -> None:
         self._stop_recording()
         self._release_resources()
-        if self.mousewheel_binding is not None:
-            self.root.unbind_class(
-                "all",
-                "<MouseWheel>",
-                self.mousewheel_binding,
-            )
+        self.root.unbind_all("<MouseWheel>")
         self.root.destroy()
 
 

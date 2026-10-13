@@ -8,14 +8,19 @@ from myosuite.envs.myo.fatigue import CumulativeFatigue
 class MyoSuiteFatigue:
     """Apply MyoSuite's 3CC-r fatigue model to SmartGlove muscle controls."""
 
-    def __init__(self, model: mujoco.MjModel, timestamp: float) -> None:
+    def __init__(
+        self,
+        model: mujoco.MjModel,  # pyright: ignore[reportAttributeAccessIssue]
+        timestamp: float,
+    ) -> None:
         self.model = model
         self.dt = float(model.opt.timestep)
         if not math.isfinite(self.dt) or self.dt <= 0.0:
             raise ValueError("Timestep MuJoCo harus finite dan lebih besar dari nol.")
 
         self.muscle_ids = np.flatnonzero(
-            model.actuator_dyntype == mujoco.mjtDyn.mjDYN_MUSCLE
+            model.actuator_dyntype
+            == mujoco.mjtDyn.mjDYN_MUSCLE  # pyright: ignore[reportAttributeAccessIssue]
         )
         if self.muscle_ids.size == 0:
             raise ValueError("Model tidak memiliki aktuator otot untuk fatigue.")

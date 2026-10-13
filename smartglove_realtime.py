@@ -10,7 +10,7 @@ from datetime import datetime
 # CONFIGURATION
 # ============================================================
 
-HOST = "0.0.0.0"
+HOST = "192.168.3.101"
 PORT = 14041
 
 PACKET_SIZE = 624
@@ -31,6 +31,11 @@ FINGERS = {
     "PINKY":  0xA8,
 }
 
+WRIST_SENSORS = {
+    "FOREARM": 0xC8,
+    "HAND": 0xE8,
+}
+
 FINGER_IDS = {
     "THUMB": 0x00000000,
     "INDEX": 0x00000100,
@@ -40,6 +45,8 @@ FINGER_IDS = {
 }
 
 FINGER_ID_ALIASES = {
+    0x02000000: "THUMB",
+    0x03000000: "THUMB",
     0x03010000: "THUMB",
     0x00010200: "MIDDLE",
     0x01000300: "RING",
@@ -134,6 +141,17 @@ def parse_packet_with_error(data):
     if len(result) != len(FINGER_IDS):
         missing = sorted(set(FINGER_IDS) - result.keys())
         return None, f"record jari tidak ditemukan: {', '.join(missing)}"
+
+    for sensor, offset in WRIST_SENSORS.items():
+        parsed = parse_finger(data, offset)
+        if parsed is None:
+            sensor_id = struct.unpack_from("<I", data, offset)[0]
+            return None, (
+                f"quaternion tidak valid pada sensor {sensor} "
+                f"offset 0x{offset:02X} (ID 0x{sensor_id:08X})"
+            )
+        result[sensor] = parsed
+
     return result, None
 
 
