@@ -11,6 +11,7 @@ from smartglove.quaternion import (
     rotvec_to_quaternion,
 )
 from smartglove.wrist_alignment import (
+    forearm_twist_rotvecs,
     principal_axis,
     relative_hand_in_forearm,
     sweep_rotvecs,
@@ -62,8 +63,12 @@ class WristFixture:
             for name in ("pro_sup", "deviation", "flexion")
         ]
 
-    def sensors(self, angles, arm_world=None):
-        """Quaternion sensor (wxyz) untuk sudut sendi (pro_sup, dev, flex) rad."""
+    def sensors(self, angles, arm_world=None, roll_forearm=False):
+        """Quaternion sensor (wxyz) untuk sudut sendi (pro_sup, dev, flex) rad.
+
+        roll_forearm=True meniru sensor manset yang ikut berputar bersama
+        radius saat pronasi/supinasi (fisik sebenarnya).
+        """
         data = mujoco.MjData(self.model)
         data.qpos[self.joint_qpos] = angles
         mujoco.mj_forward(self.model, data)
@@ -74,7 +79,15 @@ class WristFixture:
             quaternion_conjugate(data.xquat[parent]), data.xquat[lunate]
         )
         world = np.array((1.0, 0, 0, 0)) if arm_world is None else arm_world
-        forearm = quaternion_multiply(world, self.mount_forearm)
+        radius = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "radius")
+        forearm_segment = (
+            quaternion_multiply(quaternion_conjugate(data.xquat[parent]), data.xquat[radius])
+            if roll_forearm
+            else np.array((1.0, 0, 0, 0))
+        )
+        forearm = quaternion_multiply(
+            quaternion_multiply(world, forearm_segment), self.mount_forearm
+        )
         hand = quaternion_multiply(
             quaternion_multiply(world, rel), self.mount_hand
         )
@@ -92,6 +105,18 @@ class WristFixture:
             forearm.append(s["FOREARM"])
             hand.append(s["HAND"])
         return forearm, hand
+
+
+def pronation_sweep(fixture, hi_deg=70.0, lo_deg=-20.0, frames=60):
+    angles_deg = np.concatenate(
+        (np.linspace(0, hi_deg, frames // 2), np.linspace(hi_deg, lo_deg, frames))
+    )
+    forearm = []
+    for deg in angles_deg:
+        angles = np.zeros(3)
+        angles[0] = np.radians(deg)
+        forearm.append(fixture.sensors(angles, roll_forearm=True)["FOREARM"])
+    return forearm
 
 
 class ParserTests(unittest.TestCase):
@@ -170,6 +195,61 @@ class WristMappingTests(unittest.TestCase):
         self.assertAlmostEqual(mapped[flex_id], mapper.upper[2], places=3)
         self.assertTrue(mapper.saturated[2])
         np.testing.assert_allclose(mapped[mapper.qpos_ids[:2]], target[:2], atol=np.radians(0.2))
+
+
+class ForearmTwistTests(unittest.TestCase):
+    def build_mapper(self, fixture, arm_world, with_twist=True):
+        axes = {}
+        for name, index, hi in (("flexion", 2, 60), ("deviation", 1, 25)):
+            f, h = fixture.sweep(index, -5, hi)
+            axes[name] = principal_axis(sweep_rotvecs(f, h))["axis"]
+        if with_twist:
+            axes["forearm_twist"] = principal_axis(
+                forearm_twist_rotvecs(pronation_sweep(fixture))
+            )["axis"]
+        mapper = WristQposMapper(fixture.model, fixture.data, sensor_axes=axes)
+        s0 = fixture.sensors(np.zeros(3), arm_world, roll_forearm=True)
+        mujoco.mj_resetData(fixture.model, fixture.data)
+        mapper.calibrate(s0["FOREARM"], s0["HAND"])
+        return mapper
+
+    def test_pronation_only_is_invisible_to_relative_mode_but_tracked_with_twist(self) -> None:
+        fixture = WristFixture(seed=7)
+        arm = random_rotation(fixture.rng)  # lengan bertumpu pada pose acak, tetap
+        target = np.array((np.radians(55.0), 0.0, 0.0))
+        sensors = fixture.sensors(target, arm, roll_forearm=True)
+
+        relative_only = self.build_mapper(fixture, arm, with_twist=False)
+        relative_result = relative_only.map_frame(sensors)[relative_only.qpos_ids]
+        self.assertLess(abs(np.degrees(relative_result[0])), 2.0)  # pro_sup hilang
+
+        with_twist = self.build_mapper(fixture, arm)
+        result = with_twist.map_frame(sensors)[with_twist.qpos_ids]
+        np.testing.assert_allclose(result, target, atol=np.radians(0.3))
+
+    def test_joint_recovery_with_twist_channel(self) -> None:
+        fixture = WristFixture(seed=11)
+        arm = random_rotation(fixture.rng)
+        mapper = self.build_mapper(fixture, arm)
+        for ps, dev, flex in ((0.9, 0.1, 0.5), (-0.6, 0.3, -0.4), (0.4, -0.1, 0.0)):
+            sensors = fixture.sensors(np.array((ps, dev, flex)), arm, roll_forearm=True)
+            mapped = mapper.map_frame(sensors)
+            np.testing.assert_allclose(
+                mapped[mapper.qpos_ids], (ps, dev, flex), atol=np.radians(0.3)
+            )
+
+    def test_flexion_saturation_does_not_leak_into_pronation(self) -> None:
+        fixture = WristFixture(seed=13)
+        arm = random_rotation(fixture.rng)
+        mapper = self.build_mapper(fixture, arm)
+        unlimited = WristFixture(seed=13)
+        unlimited.model.jnt_limited[:] = 0
+        target = np.array((0.5, 0.1, np.radians(70.0)))
+        mapped = mapper.map_frame(unlimited.sensors(target, arm, roll_forearm=True))
+        self.assertAlmostEqual(mapped[mapper.qpos_ids[2]], mapper.upper[2], places=3)
+        np.testing.assert_allclose(
+            mapped[mapper.qpos_ids[:2]], target[:2], atol=np.radians(0.3)
+        )
 
 
 if __name__ == "__main__":

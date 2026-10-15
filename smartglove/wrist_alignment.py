@@ -55,6 +55,40 @@ def sweep_rotvecs(
     )
 
 
+def forearm_twist_rotvecs(
+    forearm_quaternions: list[np.ndarray],
+    neutral_frames: int = 10,
+) -> np.ndarray:
+    """Rotvec delta sensor FOREARM (frame lokal sensor) terhadap pose awal.
+
+    Pada pronasi/supinasi murni, sensor di manset berputar mengelilingi sumbu
+    panjang lengan bawah; sumbu itu diukur langsung dari sensor FOREARM
+    sehingga tidak bergantung pada pemasangan sensor tangan.
+    """
+    reference = normalize_quaternion(forearm_quaternions[0])
+    aligned = [
+        q if np.dot(reference, q) >= 0 else -q
+        for q in (normalize_quaternion(f) for f in forearm_quaternions[:neutral_frames])
+    ]
+    neutral = normalize_quaternion(np.mean(aligned, axis=0))
+    return np.array(
+        [
+            quaternion_to_rotvec(
+                quaternion_multiply(quaternion_conjugate(neutral), normalize_quaternion(f))
+            )
+            for f in forearm_quaternions
+        ]
+    )
+
+
+def twist_angle(delta_quaternion: np.ndarray, axis: np.ndarray) -> float:
+    """Komponen twist (rad) dari rotasi `delta` di sekitar `axis` (swing-twist)."""
+    q = normalize_quaternion(delta_quaternion)
+    unit = axis / np.linalg.norm(axis)
+    angle = 2.0 * np.arctan2(float(np.dot(q[1:], unit)), float(q[0]))
+    return float((angle + np.pi) % (2.0 * np.pi) - np.pi)
+
+
 def principal_axis(rotvecs: np.ndarray) -> dict:
     """Sumbu dominan sapuan satu-sumbu.
 

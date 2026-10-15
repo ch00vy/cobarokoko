@@ -10,6 +10,13 @@ Perbedaan utama dari versi sebelumnya:
   walaupun sensor terpasang miring.
 * IK diselesaikan TANPA batas sendi, lalu tiap sendi di-clamp ke ROM model.
   Dengan begitu saturasi satu sendi tidak menggeser sudut sendi lain.
+* Pronasi/supinasi (pro_sup) dibaca dari TWIST sensor FOREARM terhadap sumbu
+  panjang lengan bawah ("forearm_twist" di wrist_axes.json). Sensor di manset
+  ikut berputar bersama tangan, sehingga rotasi RELATIF hand|forearm nyaris nol
+  saat lengan bawah diputar; tanpa kanal twist ini pro_sup tidak dapat dibaca.
+  Fleksi/deviasi tetap dari rotasi relatif, dan diselesaikan dengan pro_sup
+  yang sudah terkunci. Tanpa "forearm_twist", mapper kembali ke perilaku lama
+  (3 sendi dari rotasi relatif).
 """
 
 import warnings
@@ -31,6 +38,7 @@ from smartglove.wrist_alignment import (
     fit_alignment,
     load_axes,
     relative_hand_in_forearm,
+    twist_angle,
 )
 
 IK_MAX_ITERATIONS = 30
@@ -79,6 +87,10 @@ class WristQposMapper:
         self._sensor_axes = sensor_axes or load_axes(axes_file, quaternion_order)
         self.alignment = np.eye(3)
         self.alignment_source = "identity (belum dikalibrasi)"
+        twist = (self._sensor_axes or {}).get("forearm_twist")
+        self.twist_axis = None if twist is None else np.asarray(twist, dtype=float)
+        self.neutral_forearm: np.ndarray | None = None
+        self.lunate_in_radius_neutral: np.ndarray | None = None
         self.neutral_relative: np.ndarray | None = None
         self.model_relative_neutral: np.ndarray | None = None
         self.neutral_qpos: np.ndarray | None = None
@@ -102,6 +114,13 @@ class WristQposMapper:
         """Simpan pose netral: sensor (relatif) dan model (relatif)."""
         mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
         self.neutral_qpos = self.data.qpos.copy()
+        self.neutral_forearm = normalize_quaternion(forearm_quaternion)
+        self.lunate_in_radius_neutral = normalize_quaternion(
+            quaternion_multiply(
+                quaternion_conjugate(normalize_quaternion(self.data.xquat[self.bodies["FOREARM"]])),
+                normalize_quaternion(self.data.xquat[self.bodies["HAND"]]),
+            )
+        )
         self.neutral_relative = relative_hand_in_forearm(
             forearm_quaternion, hand_quaternion
         )
@@ -125,28 +144,29 @@ class WristQposMapper:
                 stacklevel=2,
             )
 
-    def _solve(self, target_world: np.ndarray) -> np.ndarray:
-        """Gauss-Newton teredam pada 3 sendi wrist, tanpa batas sendi."""
+    def _solve(self, target_world: np.ndarray, free: tuple[int, ...] = (0, 1, 2)) -> np.ndarray:
+        """Gauss-Newton teredam pada sendi wrist `free`, tanpa batas sendi."""
         jacobian_position = np.zeros((3, self.model.nv))
         jacobian_rotation = np.zeros((3, self.model.nv))
         variables = self.data.qpos[self.qpos_ids].copy()
         body = self.bodies["HAND"]
+        dofs = [self.dof_ids[i] for i in free]
         for _ in range(IK_MAX_ITERATIONS):
             self.data.qpos[self.qpos_ids] = variables
             mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
             error = quaternion_error(
                 target_world, normalize_quaternion(self.data.xquat[body])
             )
-            if np.linalg.norm(error) < IK_TOLERANCE:
-                break
             mujoco.mj_jacBody(  # type: ignore[attr-defined]
                 self.model, self.data, jacobian_position, jacobian_rotation, body
             )
-            jacobian = jacobian_rotation[:, self.dof_ids]
-            delta = jacobian.T @ np.linalg.solve(
-                jacobian @ jacobian.T + IK_DAMPING * np.eye(3), error
+            jacobian = jacobian_rotation[:, dofs]
+            step = np.linalg.solve(
+                jacobian.T @ jacobian + IK_DAMPING * np.eye(len(free)), jacobian.T @ error
             )
-            variables = variables + np.clip(delta, -IK_MAX_STEP, IK_MAX_STEP)
+            if np.linalg.norm(step) < IK_TOLERANCE:
+                break
+            variables[list(free)] += np.clip(step, -IK_MAX_STEP, IK_MAX_STEP)
         return variables
 
     def map_frame(self, sensor_quaternions: dict[str, np.ndarray]) -> np.ndarray:
@@ -172,18 +192,11 @@ class WristQposMapper:
             self.alignment @ quaternion_to_rotvec(delta_sensor)
         )
 
-        mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
-        parent = normalize_quaternion(self.data.xquat[self.parent_body])
-        target_world = normalize_quaternion(
-            quaternion_multiply(
-                quaternion_multiply(parent, self.model_relative_neutral), delta_model
-            )
-        )
-
-        solved = self._solve(target_world)
+        if self.twist_axis is not None and self.lunate_in_radius_neutral is not None:
+            clamped, scaled = self._map_with_twist(sensor_quaternions["FOREARM"], delta_model)
+        else:
+            clamped, scaled = self._map_relative_only(delta_model)
         neutral = self.neutral_qpos[self.qpos_ids]
-        scaled = neutral + self.gains * (solved - neutral)
-        clamped = np.clip(scaled, self.lower, self.upper)
         self.saturated = clamped != scaled
         self.last_angles_deg = np.degrees(clamped - neutral)
 
@@ -191,3 +204,45 @@ class WristQposMapper:
         self.data.qvel[:] = 0.0
         mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
         return self.data.qpos.copy()
+
+    def _finish(self, solved: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        neutral = self.neutral_qpos[self.qpos_ids]
+        scaled = neutral + self.gains * (solved - neutral)
+        return np.clip(scaled, self.lower, self.upper), scaled
+
+    def _map_relative_only(self, delta_model: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Perilaku lama: tiga sendi dari rotasi relatif hand|forearm."""
+        mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
+        parent = normalize_quaternion(self.data.xquat[self.parent_body])
+        target_world = normalize_quaternion(
+            quaternion_multiply(
+                quaternion_multiply(parent, self.model_relative_neutral), delta_model
+            )
+        )
+        return self._finish(self._solve(target_world))
+
+    def _map_with_twist(
+        self, forearm: np.ndarray, delta_model: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """pro_sup dari twist FOREARM; deviasi/fleksi dari rotasi relatif."""
+        delta_forearm = quaternion_multiply(
+            quaternion_conjugate(self.neutral_forearm), normalize_quaternion(forearm)
+        )
+        neutral = self.neutral_qpos[self.qpos_ids]
+        pro_sup = neutral[0] + self.gains[0] * twist_angle(delta_forearm, self.twist_axis)
+        pro_sup = float(np.clip(pro_sup, self.lower[0], self.upper[0]))
+        self.data.qpos[self.qpos_ids[0]] = pro_sup
+        mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
+        radius = normalize_quaternion(self.data.xquat[self.bodies["FOREARM"]])
+        target_world = normalize_quaternion(
+            quaternion_multiply(
+                quaternion_multiply(radius, self.lunate_in_radius_neutral), delta_model
+            )
+        )
+        solved = self._solve(target_world, free=(1, 2))
+        solved[0] = pro_sup
+        # gain pro_sup sudah diterapkan pada twist; hindari menerapkannya dua kali
+        gains = self.gains.copy()
+        gains[0] = 1.0
+        scaled = neutral + gains * (solved - neutral)
+        return np.clip(scaled, self.lower, self.upper), scaled
