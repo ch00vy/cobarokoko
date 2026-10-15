@@ -1,0 +1,1110 @@
+diff --git a/GUI/smartglove_gui.py b/GUI/smartglove_gui.py
+index de7900f..e3e64f6 100644
+--- a/GUI/smartglove_gui.py
++++ b/GUI/smartglove_gui.py
+@@ -858,10 +858,11 @@ class SmartGloveGUI:
+         finger_quaternions = {
+             finger: filtered[finger] for finger in FINGER_JOINTS
+         }
+-        qpos = self.mapper.map_frame(finger_quaternions)
+         if self.wrist_mapper is None:
+             raise RuntimeError("Mapper pergelangan belum siap.")
+-        qpos = self.wrist_mapper.map_frame(filtered)
++        # Wrist lebih dulu agar IK jari memakai pose wrist frame yang sama.
++        self.wrist_mapper.map_frame(filtered)
++        qpos = self.mapper.map_frame(finger_quaternions)
+         target_activations = self.muscle_controller.update(qpos)
+         if self.fatigue_model is None:
+             raise RuntimeError("Model fatigue belum siap.")
+diff --git a/smartglove/quaternion.py b/smartglove/quaternion.py
+index 7d1e918..5194d84 100644
+--- a/smartglove/quaternion.py
++++ b/smartglove/quaternion.py
+@@ -144,3 +144,35 @@ def sensor_quaternion_to_wxyz(
+     if order == "wxyz":
+         return normalize_quaternion(values)
+     raise ValueError(f"Urutan quaternion tidak didukung: {order}")
++
++
++def quaternion_to_rotvec(quaternion: np.ndarray) -> np.ndarray:
++    """Quaternion (wxyz) -> rotation vector (rad), sudut selalu dalam [0, pi]."""
++    q = normalize_quaternion(quaternion)
++    if q[0] < 0.0:
++        q = -q
++    vector_norm = float(np.linalg.norm(q[1:]))
++    if vector_norm < 1e-12:
++        return 2.0 * q[1:]
++    return q[1:] * (2.0 * math.atan2(vector_norm, float(q[0])) / vector_norm)
++
++
++def rotvec_to_quaternion(rotvec: np.ndarray) -> np.ndarray:
++    """Rotation vector (rad) -> quaternion (wxyz)."""
++    v = np.asarray(rotvec, dtype=float)
++    angle = float(np.linalg.norm(v))
++    if angle < 1e-12:
++        return normalize_quaternion((1.0, *(0.5 * v)))
++    half = 0.5 * angle
++    return np.concatenate(([math.cos(half)], v / angle * math.sin(half)))
++
++
++def quaternion_to_matrix(quaternion: np.ndarray) -> np.ndarray:
++    w, x, y, z = normalize_quaternion(quaternion)
++    return np.array(
++        (
++            (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
++            (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
++            (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
++        )
++    )
+diff --git a/smartglove/runtime.py b/smartglove/runtime.py
+index 67b7ea2..c06735f 100644
+--- a/smartglove/runtime.py
++++ b/smartglove/runtime.py
+@@ -64,7 +64,7 @@ def run(
+         data.qvel[:] = 0.0
+         mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
+         mapper = HandQposMapper(model, data, flexion_gain)
+-        wrist_mapper = WristQposMapper(model, data)
++        wrist_mapper = WristQposMapper(model, data, quaternion_order)
+         muscle_controller = SmartGloveMuscleController(
+             model,
+             data,
+@@ -229,8 +229,10 @@ def run(
+                     finger: sensor_quaternions[finger]
+                     for finger in FINGER_JOINTS
+                 }
++                # Pergelangan dipetakan lebih dulu agar IK jari (abduksi) melihat
++                # pose wrist pada frame yang sama, bukan frame sebelumnya.
++                wrist_mapper.map_frame(sensor_quaternions)
+                 qpos = mapper.map_frame(finger_quaternions)
+-                qpos = wrist_mapper.map_frame(sensor_quaternions)
+                 muscle_controller.update(qpos)
+ 
+                 if last_packet_time is not None:
+@@ -246,10 +248,19 @@ def run(
+                         f"{np.round(np.degrees([qpos[mapper.fingers[finger]['qpos'][slot]] for slot in mapper.fingers[finger]['flexion_slots']])).astype(int).tolist()}"
+                         for finger in FINGER_JOINTS
+                     )
++                    wrist_text = " ".join(
++                        f"{name}:{angle:+.0f}{'*' if saturated else ''}"
++                        for name, angle, saturated in zip(
++                            ("ps", "dev", "flex"),
++                            wrist_mapper.last_angles_deg,
++                            wrist_mapper.saturated,
++                        )
++                    )
+                     print(
+                         f"Frame {frame_number:>7} | "
+                         f"Rate {rate:5.1f} Hz | "
+-                        f"fleksi MCP/PIP/DIP (thumb CMC/MP/IP): {finger_flexion}",
++                        f"fleksi MCP/PIP/DIP (thumb CMC/MP/IP): {finger_flexion} | "
++                        f"wrist deg (* = di batas ROM) {wrist_text}",
+                         end="\r",
+                     )
+                     print()
+diff --git a/smartglove/wrist_alignment.py b/smartglove/wrist_alignment.py
+new file mode 100644
+index 0000000..c76ea32
+--- /dev/null
++++ b/smartglove/wrist_alignment.py
+@@ -0,0 +1,155 @@
++"""Penyelarasan sumbu sensor pergelangan terhadap sumbu sendi MyoHand.
++
++Sensor IMU pada punggung tangan dan lengan bawah dipasang dengan orientasi
++bebas, jadi sumbu lokal sensor TIDAK sama dengan sumbu fleksi/deviasi/pronasi
++model. Modul ini mengestimasi sumbu anatomis di frame lokal sensor dari
++gerakan kalibrasi (sapuan satu-sumbu), lalu menyusun rotasi tetap A
++(frame sensor -> frame lunate model) dengan metode Kabsch.
++"""
++
++import json
++from pathlib import Path
++
++import numpy as np
++
++from smartglove.quaternion import (
++    normalize_quaternion,
++    quaternion_conjugate,
++    quaternion_multiply,
++    quaternion_to_rotvec,
++)
++
++AXIS_NAMES = ("flexion", "deviation", "pro_sup")
++DEFAULT_AXES_FILE = Path(__file__).with_name("wrist_axes.json")
++
++
++def relative_hand_in_forearm(forearm: np.ndarray, hand: np.ndarray) -> np.ndarray:
++    """Orientasi tangan pada frame lengan bawah: conj(F) * H."""
++    return normalize_quaternion(
++        quaternion_multiply(
++            quaternion_conjugate(normalize_quaternion(forearm)),
++            normalize_quaternion(hand),
++        )
++    )
++
++
++def sweep_rotvecs(
++    forearm_quaternions: list[np.ndarray],
++    hand_quaternions: list[np.ndarray],
++    neutral_frames: int = 10,
++) -> np.ndarray:
++    """Rotvec delta (frame tangan saat netral) untuk satu sapuan gerak."""
++    relative = [
++        relative_hand_in_forearm(f, h)
++        for f, h in zip(forearm_quaternions, hand_quaternions)
++    ]
++    reference = relative[0]
++    # Rata-rata kasar beberapa frame awal sebagai netral sapuan.
++    aligned = [r if np.dot(reference, r) >= 0 else -r for r in relative[:neutral_frames]]
++    neutral = normalize_quaternion(np.mean(aligned, axis=0))
++    return np.array(
++        [
++            quaternion_to_rotvec(quaternion_multiply(quaternion_conjugate(neutral), r))
++            for r in relative
++        ]
++    )
++
++
++def principal_axis(rotvecs: np.ndarray) -> dict:
++    """Sumbu dominan sapuan satu-sumbu.
++
++    Arah sumbu diambil dari variasi data (SVD setelah centering) sehingga tetap
++    benar walau rekaman tidak dimulai tepat di pose netral; simpangan dihitung
++    terhadap pose awal rekaman.
++    """
++    _, singular, vt = np.linalg.svd(rotvecs - rotvecs.mean(axis=0), full_matrices=False)
++    axis = vt[0] / np.linalg.norm(vt[0])
++    projected = np.degrees(rotvecs @ axis)
++    # Tanda sumbu: sisi dengan simpangan terbesar dibuat positif.
++    if abs(projected.min()) > abs(projected.max()):
++        axis, projected = -axis, -projected
++    energy = singular**2
++    return {
++        "axis": axis,
++        "explained": float(energy[0] / energy.sum()),
++        "min_deg": float(projected.min()),
++        "max_deg": float(projected.max()),
++    }
++
++
++def _orthonormal_basis(primary: np.ndarray, secondary: np.ndarray) -> np.ndarray:
++    """Basis ortonormal kanan: e1 = primary, e2 = secondary tegak lurus e1."""
++    e1 = primary / np.linalg.norm(primary)
++    residual = secondary - np.dot(secondary, e1) * e1
++    norm = np.linalg.norm(residual)
++    if norm < 1e-6:
++        raise ValueError("Sumbu fleksi dan deviasi hampir sejajar; ulangi rekaman.")
++    e2 = residual / norm
++    return np.array((e1, e2, np.cross(e1, e2)))
++
++
++def fit_alignment(
++    sensor_axes: dict[str, np.ndarray],
++    model_axes: dict[str, np.ndarray],
++) -> np.ndarray:
++    """Rotasi A (frame sensor -> frame lunate model).
++
++    Sumbu fleksi (gerak paling bersih dan dominan) dipetakan EKSAK; sumbu
++    deviasi hanya menentukan putaran di sekitar sumbu fleksi (komponen tegak
++    lurusnya). Sumbu ketiga (pro_sup) mengikuti aturan tangan kanan, sehingga
++    tanda pronasi tidak perlu ditentukan terpisah.
++    """
++    for name in ("flexion", "deviation"):
++        if name not in sensor_axes or name not in model_axes:
++            raise ValueError(f"Sumbu {name} dibutuhkan untuk penyelarasan.")
++    sensor_basis = _orthonormal_basis(sensor_axes["flexion"], sensor_axes["deviation"])
++    model_basis = _orthonormal_basis(model_axes["flexion"], model_axes["deviation"])
++    return model_basis.T @ sensor_basis
++
++
++def predicted_pro_sup_axis(sensor_axes: dict[str, np.ndarray]) -> np.ndarray:
++    """Sumbu pronasi di frame sensor yang diprediksi dari fleksi + deviasi."""
++    return _orthonormal_basis(sensor_axes["flexion"], sensor_axes["deviation"])[2]
++
++
++def axes_quality(sensor_axes: dict[str, np.ndarray]) -> dict[str, float]:
++    """Sudut antar sumbu terukur (idealnya 90 derajat)."""
++    names = [n for n in AXIS_NAMES if n in sensor_axes]
++    result = {}
++    for i, a in enumerate(names):
++        for b in names[i + 1 :]:
++            cosine = float(
++                np.clip(
++                    np.dot(sensor_axes[a], sensor_axes[b])
++                    / (np.linalg.norm(sensor_axes[a]) * np.linalg.norm(sensor_axes[b])),
++                    -1.0,
++                    1.0,
++                )
++            )
++            result[f"{a}-{b}"] = float(np.degrees(np.arccos(cosine)))
++    return result
++
++
++def save_axes(path: Path, order: str, axes: dict[str, dict]) -> None:
++    path = Path(path)
++    existing = json.loads(path.read_text()) if path.exists() else {}
++    existing[order] = {
++        name: {
++            "axis": [float(v) for v in info["axis"]],
++            "explained": info.get("explained"),
++            "min_deg": info.get("min_deg"),
++            "max_deg": info.get("max_deg"),
++        }
++        for name, info in axes.items()
++    }
++    path.write_text(json.dumps(existing, indent=2))
++
++
++def load_axes(path: Path, order: str) -> dict[str, np.ndarray] | None:
++    path = Path(path)
++    if not path.exists():
++        return None
++    stored = json.loads(path.read_text()).get(order)
++    if not stored:
++        return None
++    return {name: np.array(info["axis"], dtype=float) for name, info in stored.items()}
+diff --git a/smartglove/wrist_axes.json b/smartglove/wrist_axes.json
+new file mode 100644
+index 0000000..001e44e
+--- /dev/null
++++ b/smartglove/wrist_axes.json
+@@ -0,0 +1,66 @@
++{
++  "xyzw": {
++    "flexion": {
++      "axis": [
++        0.665398609169092,
++        -0.1174218660191631,
++        -0.7371952226489369
++      ],
++      "explained": 0.9936445122408745,
++      "min_deg": -34.62529244206589,
++      "max_deg": 74.90247000330832
++    },
++    "deviation": {
++      "axis": [
++        -0.07481935706055447,
++        -0.815030715909144,
++        0.574566789793557
++      ],
++      "explained": 0.9734619767789469,
++      "min_deg": -18.850056720991226,
++      "max_deg": 34.83812612937561
++    },
++    "pro_sup": {
++      "axis": [
++        0.710019689507753,
++        0.1382702921031996,
++        -0.6904732919041909
++      ],
++      "explained": 0.7069243964285443,
++      "min_deg": -22.38495701962227,
++      "max_deg": 61.190456910523196
++    }
++  },
++  "wxyz": {
++    "flexion": {
++      "axis": [
++        0.9251872085718424,
++        0.04048219518513722,
++        -0.37734575785085306
++      ],
++      "explained": 0.9858163929199969,
++      "min_deg": -33.03318927049453,
++      "max_deg": 70.52467006609419
++    },
++    "deviation": {
++      "axis": [
++        0.13101805395042038,
++        -0.4013123052296773,
++        0.9065223125827003
++      ],
++      "explained": 0.9889606428271426,
++      "min_deg": -28.505617980248545,
++      "max_deg": 49.06714684607503
++    },
++    "pro_sup": {
++      "axis": [
++        0.21317095785590887,
++        0.3155027257258403,
++        -0.9246708456452812
++      ],
++      "explained": 0.5947176377476204,
++      "min_deg": -33.388626422693925,
++      "max_deg": 52.29333884065678
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/smartglove/wrist_mapping.py b/smartglove/wrist_mapping.py
+index f0665d0..906531f 100644
+--- a/smartglove/wrist_mapping.py
++++ b/smartglove/wrist_mapping.py
+@@ -1,148 +1,193 @@
++"""Pemetaan pergelangan Rokoko Smartglove -> sendi wrist MyoHand.
++
++Perbedaan utama dari versi sebelumnya:
++
++* Yang dipetakan adalah rotasi RELATIF tangan terhadap lengan bawah
++  (conj(FOREARM) * HAND), bukan orientasi absolut kedua sensor. Gerakan seluruh
++  lengan di ruang dunia tidak lagi "bocor" ke sendi pro_sup/deviation/flexion.
++* Sumbu lokal sensor diselaraskan ke sumbu sendi model lewat rotasi tetap A
++  (lihat wrist_alignment.py), sehingga fleksi sensor menjadi fleksi model
++  walaupun sensor terpasang miring.
++* IK diselesaikan TANPA batas sendi, lalu tiap sendi di-clamp ke ROM model.
++  Dengan begitu saturasi satu sendi tidak menggeser sudut sendi lain.
++"""
++
++import warnings
++
+ import mujoco
+ import numpy as np
+ 
+-from smartglove.config import IK_ITERATIONS
+ from smartglove.quaternion import (
+     normalize_quaternion,
+     quaternion_conjugate,
+     quaternion_error,
+     quaternion_multiply,
++    quaternion_to_matrix,
++    quaternion_to_rotvec,
++    rotvec_to_quaternion,
++)
++from smartglove.wrist_alignment import (
++    DEFAULT_AXES_FILE,
++    fit_alignment,
++    load_axes,
++    relative_hand_in_forearm,
+ )
+ 
++IK_MAX_ITERATIONS = 30
++IK_TOLERANCE = 1e-6
++IK_DAMPING = 1e-6
++IK_MAX_STEP = 0.3
++
+ 
+ class WristQposMapper:
+-    def __init__(self, model, data) -> None:
++    JOINT_NAMES = ("pro_sup", "deviation", "flexion")
++
++    def __init__(
++        self,
++        model,
++        data,
++        quaternion_order: str = "xyzw",
++        axes_file=DEFAULT_AXES_FILE,
++        sensor_axes: dict[str, np.ndarray] | None = None,
++        gains: tuple[float, float, float] = (1.0, 1.0, 1.0),
++    ) -> None:
+         self.model = model
+         self.data = data
+-        self.sensor_to_model: dict[str, np.ndarray] | None = None
++        self.quaternion_order = quaternion_order
++        self.gains = np.asarray(gains, dtype=float)
++        if self.gains.shape != (3,) or not np.all(np.isfinite(self.gains)):
++            raise ValueError("gains harus berisi tiga nilai finite.")
+         self.bodies = {
+-            "FOREARM": self._name_id(
+-                mujoco.mjtObj.mjOBJ_BODY, "radius"  # type: ignore[attr-defined]
+-            ),
+-            "HAND": self._name_id(
+-                mujoco.mjtObj.mjOBJ_BODY, "lunate"  # type: ignore[attr-defined]
+-            ),
++            "FOREARM": self._name_id(mujoco.mjtObj.mjOBJ_BODY, "radius"),  # type: ignore[attr-defined]
++            "HAND": self._name_id(mujoco.mjtObj.mjOBJ_BODY, "lunate"),  # type: ignore[attr-defined]
+         }
++        # Frame induk radius tidak bergantung pada sendi wrist.
++        self.parent_body = int(model.body_parentid[self.bodies["FOREARM"]])
+         self.joints = [
+-            self._name_id(
+-                mujoco.mjtObj.mjOBJ_JOINT, name  # type: ignore[attr-defined]
+-            )
+-            for name in ("pro_sup", "deviation", "flexion")
++            self._name_id(mujoco.mjtObj.mjOBJ_JOINT, name)  # type: ignore[attr-defined]
++            for name in self.JOINT_NAMES
+         ]
+-        self.qpos_ids = [int(model.jnt_qposadr[joint]) for joint in self.joints]
+-        self.dof_ids = [int(model.jnt_dofadr[joint]) for joint in self.joints]
++        self.qpos_ids = [int(model.jnt_qposadr[j]) for j in self.joints]
++        self.dof_ids = [int(model.jnt_dofadr[j]) for j in self.joints]
+         self.lower = np.array(
+-            [
+-                model.jnt_range[joint][0]
+-                if model.jnt_limited[joint]
+-                else -np.inf
+-                for joint in self.joints
+-            ],
+-            dtype=float,
++            [model.jnt_range[j][0] if model.jnt_limited[j] else -np.inf for j in self.joints]
+         )
+         self.upper = np.array(
+-            [
+-                model.jnt_range[joint][1]
+-                if model.jnt_limited[joint]
+-                else np.inf
+-                for joint in self.joints
+-            ],
+-            dtype=float,
++            [model.jnt_range[j][1] if model.jnt_limited[j] else np.inf for j in self.joints]
+         )
+ 
++        self._sensor_axes = sensor_axes or load_axes(axes_file, quaternion_order)
++        self.alignment = np.eye(3)
++        self.alignment_source = "identity (belum dikalibrasi)"
++        self.neutral_relative: np.ndarray | None = None
++        self.model_relative_neutral: np.ndarray | None = None
++        self.neutral_qpos: np.ndarray | None = None
++        self.saturated = np.zeros(3, dtype=bool)
++        self.last_angles_deg = np.zeros(3)
++
+     def _name_id(self, object_type, name: str) -> int:
+-        object_id = mujoco.mj_name2id(  # type: ignore[attr-defined]
+-            self.model,
+-            object_type,
+-            name,
+-        )
++        object_id = mujoco.mj_name2id(self.model, object_type, name)  # type: ignore[attr-defined]
+         if object_id < 0:
+             raise ValueError(f"Objek MuJoCo tidak ditemukan: {name}")
+         return object_id
+ 
+-    def calibrate(
+-        self,
+-        forearm_quaternion: np.ndarray,
+-        hand_quaternion: np.ndarray,
+-    ) -> None:
++    def _model_axes_in_hand_frame(self) -> dict[str, np.ndarray]:
++        rotation = quaternion_to_matrix(self.data.xquat[self.bodies["HAND"]])
++        return {
++            name: rotation.T @ np.asarray(self.data.xaxis[joint], dtype=float)
++            for name, joint in zip(self.JOINT_NAMES, self.joints)
++        }
++
++    def calibrate(self, forearm_quaternion: np.ndarray, hand_quaternion: np.ndarray) -> None:
++        """Simpan pose netral: sensor (relatif) dan model (relatif)."""
+         mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
+-        self.sensor_to_model = {
+-            sensor: normalize_quaternion(
+-                quaternion_multiply(
+-                    self.data.xquat[body],
+-                    quaternion_conjugate(normalize_quaternion(sensor_quaternion)),
+-                )
++        self.neutral_qpos = self.data.qpos.copy()
++        self.neutral_relative = relative_hand_in_forearm(
++            forearm_quaternion, hand_quaternion
++        )
++        self.model_relative_neutral = normalize_quaternion(
++            quaternion_multiply(
++                quaternion_conjugate(normalize_quaternion(self.data.xquat[self.parent_body])),
++                normalize_quaternion(self.data.xquat[self.bodies["HAND"]]),
+             )
+-            for sensor, body, sensor_quaternion in (
+-                ("FOREARM", self.bodies["FOREARM"], forearm_quaternion),
+-                ("HAND", self.bodies["HAND"], hand_quaternion),
++        )
++        model_axes = self._model_axes_in_hand_frame()
++        if self._sensor_axes and {"flexion", "deviation"} <= self._sensor_axes.keys():
++            self.alignment = fit_alignment(self._sensor_axes, model_axes)
++            self.alignment_source = "sapuan kalibrasi (wrist_axes.json)"
++        else:
++            self.alignment = np.eye(3)
++            self.alignment_source = "identity (belum dikalibrasi)"
++            warnings.warn(
++                "Sumbu sensor wrist belum dikalibrasi: diasumsikan sama dengan "
++                "sumbu model. Jalankan tools/calibrate_wrist_axes.py agar derajat "
++                "gerak wrist sesuai.",
++                stacklevel=2,
+             )
+-        }
+ 
+-    def _fit_orientations(
+-        self,
+-        targets: dict[str, np.ndarray],
+-    ) -> None:
++    def _solve(self, target_world: np.ndarray) -> np.ndarray:
++        """Gauss-Newton teredam pada 3 sendi wrist, tanpa batas sendi."""
+         jacobian_position = np.zeros((3, self.model.nv))
+         jacobian_rotation = np.zeros((3, self.model.nv))
+-        variables = np.clip(self.data.qpos[self.qpos_ids], self.lower, self.upper)
+-
+-        for _ in range(IK_ITERATIONS):
++        variables = self.data.qpos[self.qpos_ids].copy()
++        body = self.bodies["HAND"]
++        for _ in range(IK_MAX_ITERATIONS):
+             self.data.qpos[self.qpos_ids] = variables
+             mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
+-            errors = []
+-            jacobians = []
+-
+-            for sensor, body in self.bodies.items():
+-                current = normalize_quaternion(self.data.xquat[body])
+-                errors.append(quaternion_error(targets[sensor], current))
+-                mujoco.mj_jacBody(  # type: ignore[attr-defined]
+-                    self.model,
+-                    self.data,
+-                    jacobian_position,
+-                    jacobian_rotation,
+-                    body,
+-                )
+-                jacobians.append(jacobian_rotation[:, self.dof_ids].copy())
+-
+-            error = np.concatenate(errors)
+-            if np.linalg.norm(error) < 1e-5:
++            error = quaternion_error(
++                target_world, normalize_quaternion(self.data.xquat[body])
++            )
++            if np.linalg.norm(error) < IK_TOLERANCE:
+                 break
+-
+-            jacobian = np.vstack(jacobians)
+-            damped_system = jacobian @ jacobian.T + 1e-5 * np.eye(6)
+-            delta = jacobian.T @ np.linalg.solve(damped_system, error)
+-            variables = np.clip(
+-                variables + np.clip(delta, -0.15, 0.15),
+-                self.lower,
+-                self.upper,
++            mujoco.mj_jacBody(  # type: ignore[attr-defined]
++                self.model, self.data, jacobian_position, jacobian_rotation, body
+             )
++            jacobian = jacobian_rotation[:, self.dof_ids]
++            delta = jacobian.T @ np.linalg.solve(
++                jacobian @ jacobian.T + IK_DAMPING * np.eye(3), error
++            )
++            variables = variables + np.clip(delta, -IK_MAX_STEP, IK_MAX_STEP)
++        return variables
+ 
+-        self.data.qpos[self.qpos_ids] = variables
+-        self.data.qvel[:] = 0.0
+-        mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
+-
+-    def map_frame(
+-        self,
+-        sensor_quaternions: dict[str, np.ndarray],
+-    ) -> np.ndarray:
+-        if self.sensor_to_model is None:
++    def map_frame(self, sensor_quaternions: dict[str, np.ndarray]) -> np.ndarray:
++        if self.neutral_relative is None or self.model_relative_neutral is None:
+             raise RuntimeError("Mapper pergelangan harus dikalibrasi lebih dulu.")
+-        missing = set(self.bodies) - sensor_quaternions.keys()
++        if self.neutral_qpos is None:
++            raise RuntimeError("Pose netral model belum tersimpan.")
++        missing = {"FOREARM", "HAND"} - sensor_quaternions.keys()
+         if missing:
+             raise ValueError(
+-                f"Quaternion sensor pergelangan tidak tersedia: "
++                "Quaternion sensor pergelangan tidak tersedia: "
+                 f"{', '.join(sorted(missing))}."
+             )
+ 
+-        targets = {
+-            sensor: normalize_quaternion(
+-                quaternion_multiply(
+-                    self.sensor_to_model[sensor],
+-                    sensor_quaternions[sensor],
+-                )
++        relative = relative_hand_in_forearm(
++            sensor_quaternions["FOREARM"], sensor_quaternions["HAND"]
++        )
++        delta_sensor = quaternion_multiply(
++            quaternion_conjugate(self.neutral_relative), relative
++        )
++        # Rotasi tetap A memetakan rotvec frame-sensor ke frame-lunate model.
++        delta_model = rotvec_to_quaternion(
++            self.alignment @ quaternion_to_rotvec(delta_sensor)
++        )
++
++        mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
++        parent = normalize_quaternion(self.data.xquat[self.parent_body])
++        target_world = normalize_quaternion(
++            quaternion_multiply(
++                quaternion_multiply(parent, self.model_relative_neutral), delta_model
+             )
+-            for sensor in self.bodies
+-        }
+-        self._fit_orientations(targets)
++        )
++
++        solved = self._solve(target_world)
++        neutral = self.neutral_qpos[self.qpos_ids]
++        scaled = neutral + self.gains * (solved - neutral)
++        clamped = np.clip(scaled, self.lower, self.upper)
++        self.saturated = clamped != scaled
++        self.last_angles_deg = np.degrees(clamped - neutral)
++
++        self.data.qpos[self.qpos_ids] = clamped
++        self.data.qvel[:] = 0.0
++        mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
+         return self.data.qpos.copy()
+diff --git a/smartglove_realtime.py b/smartglove_realtime.py
+index 873e0f0..dec3847 100644
+--- a/smartglove_realtime.py
++++ b/smartglove_realtime.py
+@@ -52,6 +52,24 @@ FINGER_ID_ALIASES = {
+     0x01000300: "RING",
+ }
+ 
++# Byte ke-1 (bit 8-15) dari ID record adalah indeks sensor yang stabil:
++# 0=THUMB 1=INDEX 2=MIDDLE 3=RING 4=PINKY 5=FOREARM 6=HAND. Byte lainnya
++# berubah-ubah (mis. 0x03010000, 0x01010500) sehingga tabel alias ID penuh
++# tidak andal. Terverifikasi pada 2800 paket capture di repo ini.
++SENSOR_INDEX = {
++    "THUMB": 0,
++    "INDEX": 1,
++    "MIDDLE": 2,
++    "RING": 3,
++    "PINKY": 4,
++    "FOREARM": 5,
++    "HAND": 6,
++}
++
++
++def sensor_index_from_id(record_id: int) -> int:
++    return (record_id >> 8) & 0xFF
++
+ 
+ # ============================================================
+ # PARSER
+@@ -107,49 +125,35 @@ def parse_packet(data):
+ 
+ 
+ def parse_packet_with_error(data):
+-    """Parse a packet and return a reason when its contents are invalid."""
++    """Parse a packet and return a reason when its contents are invalid.
++
++    Setiap slot (offset) harus membawa indeks sensor yang sesuai dengan
++    posisinya, termasuk FOREARM dan HAND yang sebelumnya tidak divalidasi.
++    """
+     if len(data) != PACKET_SIZE:
+         return None, f"ukuran {len(data)} bytes (diharapkan {PACKET_SIZE})"
+ 
+-    finger_by_id = {finger_id: finger for finger, finger_id in FINGER_IDS.items()}
+-    finger_by_id.update(FINGER_ID_ALIASES)
+     result = {}
++    slots = {**FINGERS, **WRIST_SENSORS}
+ 
+-    for offset in FINGERS.values():
++    for sensor, offset in slots.items():
+         parsed = parse_finger(data, offset)
+ 
+         if parsed is None:
+-            finger_id = struct.unpack_from("<I", data, offset)[0]
++            record_id = struct.unpack_from("<I", data, offset)[0]
+             return None, (
+-                f"quaternion tidak valid pada record offset 0x{offset:02X} "
+-                f"(ID 0x{finger_id:08X})"
++                f"quaternion tidak valid pada sensor {sensor} "
++                f"offset 0x{offset:02X} (ID 0x{record_id:08X})"
+             )
+ 
+-        finger = finger_by_id.get(parsed["id"])
+-        if finger is None:
+-            return None, (
+-                f"ID jari tidak dikenal 0x{parsed['id']:08X} "
+-                f"pada record offset 0x{offset:02X}"
+-            )
+-        if finger in result:
++        index = sensor_index_from_id(parsed["id"])
++        if index != SENSOR_INDEX[sensor]:
+             return None, (
+-                f"ID jari {finger} duplikat pada record offset 0x{offset:02X}"
++                f"ID 0x{parsed['id']:08X} pada offset 0x{offset:02X} membawa "
++                f"indeks sensor {index}, diharapkan {SENSOR_INDEX[sensor]} "
++                f"({sensor})"
+             )
+ 
+-        result[finger] = parsed
+-
+-    if len(result) != len(FINGER_IDS):
+-        missing = sorted(set(FINGER_IDS) - result.keys())
+-        return None, f"record jari tidak ditemukan: {', '.join(missing)}"
+-
+-    for sensor, offset in WRIST_SENSORS.items():
+-        parsed = parse_finger(data, offset)
+-        if parsed is None:
+-            sensor_id = struct.unpack_from("<I", data, offset)[0]
+-            return None, (
+-                f"quaternion tidak valid pada sensor {sensor} "
+-                f"offset 0x{offset:02X} (ID 0x{sensor_id:08X})"
+-            )
+         result[sensor] = parsed
+ 
+     return result, None
+diff --git a/test/test_wrist_mapping.py b/test/test_wrist_mapping.py
+index 1359c2a..5cf1fcc 100644
+--- a/test/test_wrist_mapping.py
++++ b/test/test_wrist_mapping.py
+@@ -1,19 +1,100 @@
+-import importlib
+ import unittest
+ 
+-import gymnasium as gym
+ import mujoco
+ import numpy as np
+ 
+-from smartglove.config import ENV_NAME
+-from smartglove.quaternion import quaternion_conjugate, quaternion_multiply
++from smartglove.quaternion import (
++    quaternion_conjugate,
++    quaternion_multiply,
++    quaternion_to_matrix,
++    quaternion_to_rotvec,
++    rotvec_to_quaternion,
++)
++from smartglove.wrist_alignment import (
++    principal_axis,
++    relative_hand_in_forearm,
++    sweep_rotvecs,
++)
+ from smartglove.wrist_mapping import WristQposMapper
+ from smartglove_realtime import parse_packet_with_error
+ 
+-importlib.import_module("myosuite")
++# Rantai wrist yang meniru myohand_body.xml: radius(pro_sup) -> lunate(deviation, flexion).
++WRIST_XML = """
++<mujoco>
++  <compiler angle="radian"/>
++  <worldbody>
++    <body name="forearm_root" pos="0 0 1" euler="0.3 -0.4 0.2">
++      <geom type="sphere" size="0.01" mass="1"/>
++      <body name="radius" pos="0 -0.01 0.02">
++        <joint name="pro_sup" axis="-0.017161 0.992666 -0.119668" range="-1.5708 1.5708"/>
++        <geom type="sphere" size="0.01" mass="1"/>
++        <body name="lunate" pos="0.018 -0.24 0.025">
++          <joint name="deviation" axis="0 0 1" range="-0.174533 0.436332"/>
++          <joint name="flexion" axis="1 0 0" range="-0.785398 0.785398"/>
++          <geom type="sphere" size="0.01" mass="1"/>
++        </body>
++      </body>
++    </body>
++  </worldbody>
++</mujoco>
++"""
+ 
+ 
+-class WristMappingTests(unittest.TestCase):
++def random_rotation(rng: np.random.Generator) -> np.ndarray:
++    q = rng.normal(size=4)
++    return q / np.linalg.norm(q)
++
++
++class WristFixture:
++    """Simulasi sensor: pemasangan sensor acak + gerak lengan global acak."""
++
++    def __init__(self, seed: int = 0) -> None:
++        rng = np.random.default_rng(seed)
++        self.model = mujoco.MjModel.from_xml_string(WRIST_XML)
++        self.data = mujoco.MjData(self.model)
++        mujoco.mj_forward(self.model, self.data)
++        self.rng = rng
++        self.mount_hand = random_rotation(rng)  # Sh: sensor tangan terhadap lunate
++        self.mount_forearm = random_rotation(rng)  # Sf
++        self.joint_qpos = [
++            int(self.model.jnt_qposadr[mujoco.mj_name2id(
++                self.model, mujoco.mjtObj.mjOBJ_JOINT, name)])
++            for name in ("pro_sup", "deviation", "flexion")
++        ]
++
++    def sensors(self, angles, arm_world=None):
++        """Quaternion sensor (wxyz) untuk sudut sendi (pro_sup, dev, flex) rad."""
++        data = mujoco.MjData(self.model)
++        data.qpos[self.joint_qpos] = angles
++        mujoco.mj_forward(self.model, data)
++        parent = self.model.body_parentid[
++            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "radius")]
++        lunate = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "lunate")
++        rel = quaternion_multiply(
++            quaternion_conjugate(data.xquat[parent]), data.xquat[lunate]
++        )
++        world = np.array((1.0, 0, 0, 0)) if arm_world is None else arm_world
++        forearm = quaternion_multiply(world, self.mount_forearm)
++        hand = quaternion_multiply(
++            quaternion_multiply(world, rel), self.mount_hand
++        )
++        return {"FOREARM": forearm, "HAND": hand}
++
++    def sweep(self, joint_index, lo_deg, hi_deg, frames=60):
++        angles_deg = np.concatenate(
++            (np.linspace(0, hi_deg, frames // 2), np.linspace(hi_deg, lo_deg, frames))
++        )
++        forearm, hand = [], []
++        for deg in angles_deg:
++            angles = np.zeros(3)
++            angles[joint_index] = np.radians(deg)
++            s = self.sensors(angles)
++            forearm.append(s["FOREARM"])
++            hand.append(s["HAND"])
++        return forearm, hand
++
++
++class ParserTests(unittest.TestCase):
+     def test_parser_reads_wrist_sensor_records(self) -> None:
+         packet = bytearray(624)
+         records = {
+@@ -26,81 +107,70 @@ class WristMappingTests(unittest.TestCase):
+             0xE8: 0x00000600,
+         }
+         for offset, identifier in records.items():
+-            packet[offset : offset + 32] = (
+-                identifier.to_bytes(4, "little")
+-                + np.array(
+-                    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+-                    dtype="<f4",
+-                ).tobytes()
+-            )
+-
++            packet[offset : offset + 32] = identifier.to_bytes(4, "little") + np.array(
++                (0, 0, 0, 0, 0, 0, 1.0), dtype="<f4"
++            ).tobytes()
+         parsed, error = parse_packet_with_error(bytes(packet))
+-
+         self.assertIsNone(error)
+-        if parsed is None:
+-            self.fail("A packet with seven valid sensor records was rejected.")
+         self.assertEqual(
+             set(parsed),
+             {"THUMB", "INDEX", "MIDDLE", "RING", "PINKY", "FOREARM", "HAND"},
+         )
+ 
+-    def test_wrist_mapper_tracks_model_wrist_pose(self) -> None:
+-        env = gym.make(ENV_NAME)
+-        try:
+-            unwrapped = env.unwrapped
+-            model = getattr(unwrapped, "mj_model")
+-            data = getattr(unwrapped, "mj_data")
+-            data.qpos[:] = getattr(unwrapped, "init_qpos")
+-            data.qvel[:] = 0.0
+-            mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
+-            mapper = WristQposMapper(model, data)
+-            neutral_forearm = np.array((1.0, 0.0, 0.0, 0.0))
+-            neutral_hand = np.array((1.0, 0.0, 0.0, 0.0))
+-            mapper.calibrate(neutral_forearm, neutral_hand)
+-            if mapper.sensor_to_model is None:
+-                self.fail("Wrist calibration did not produce sensor alignment.")
+-
+-            qpos_ids = mapper.qpos_ids
+-            neutral_qpos = data.qpos.copy()
+-            neutral_result = mapper.map_frame(
+-                {
+-                    "FOREARM": neutral_forearm,
+-                    "HAND": neutral_hand,
+-                }
+-            )
+-            np.testing.assert_allclose(
+-                neutral_result[qpos_ids],
+-                neutral_qpos[qpos_ids],
+-                atol=1e-3,
+-            )
++    def test_parser_rejects_swapped_wrist_slots(self) -> None:
++        packet = bytearray(624)
++        records = {0x28: 0x0, 0x48: 0x100, 0x68: 0x200, 0x88: 0x300,
++                   0xA8: 0x400, 0xC8: 0x600, 0xE8: 0x500}  # FOREARM/HAND tertukar
++        for offset, identifier in records.items():
++            packet[offset : offset + 32] = identifier.to_bytes(4, "little") + np.array(
++                (0, 0, 0, 0, 0, 0, 1.0), dtype="<f4"
++            ).tobytes()
++        parsed, error = parse_packet_with_error(bytes(packet))
++        self.assertIsNone(parsed)
++        self.assertIn("FOREARM", error)
+ 
+-            target_qpos = neutral_qpos.copy()
+-            target_qpos[qpos_ids] += np.array((0.2, 0.1, -0.1))
+-            target_qpos[qpos_ids] = np.clip(
+-                target_qpos[qpos_ids], mapper.lower, mapper.upper
+-            )
+-            data.qpos[qpos_ids] = target_qpos[qpos_ids]
+-            mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
+-            target_orientations = {
+-                sensor: data.xquat[body].copy()
+-                for sensor, body in mapper.bodies.items()
+-            }
+-            sensor_orientations = {
+-                sensor: quaternion_multiply(
+-                    quaternion_conjugate(mapper.sensor_to_model[sensor]),
+-                    target_orientations[sensor],
+-                )
+-                for sensor in mapper.bodies
+-            }
+-
+-            data.qpos[:] = neutral_qpos
+-            mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
+-            mapped_qpos = mapper.map_frame(sensor_orientations)
+ 
++class WristMappingTests(unittest.TestCase):
++    def build_mapper(self, fixture):
++        axes = {}
++        # Sapuan satu-sumbu; sisi simpangan terbesar dibuat positif -> pakai
++        # rentang searah rentang model (fleksi 0..+60, deviasi 0..+25).
++        for name, index, hi in (("flexion", 2, 60), ("deviation", 1, 25)):
++            f, h = fixture.sweep(index, -5, hi)
++            axes[name] = principal_axis(sweep_rotvecs(f, h))
++        mapper = WristQposMapper(
++            fixture.model, fixture.data,
++            sensor_axes={k: v["axis"] for k, v in axes.items()},
++        )
++        s0 = fixture.sensors(np.zeros(3))
++        mujoco.mj_resetData(fixture.model, fixture.data)
++        mapper.calibrate(s0["FOREARM"], s0["HAND"])
++        return mapper
++
++    def test_recovers_joint_angles_with_tilted_sensors_and_arm_motion(self) -> None:
++        fixture = WristFixture(seed=3)
++        mapper = self.build_mapper(fixture)
++        for ps, dev, flex in ((0.3, 0.1, 0.5), (-0.5, 0.3, -0.4), (0.0, -0.1, 0.0)):
++            arm = random_rotation(fixture.rng)  # seluruh lengan bergerak di dunia
++            mapped = mapper.map_frame(fixture.sensors(np.array((ps, dev, flex)), arm))
+             np.testing.assert_allclose(
+-                mapped_qpos[qpos_ids],
+-                target_qpos[qpos_ids],
+-                atol=1e-3,
++                mapped[mapper.qpos_ids], (ps, dev, flex), atol=np.radians(0.2)
+             )
+-        finally:
+-            env.close()
++
++    def test_saturation_does_not_leak_into_other_joints(self) -> None:
++        fixture = WristFixture(seed=5)
++        mapper = self.build_mapper(fixture)
++        # Fleksi 70° melewati batas model (45°); pro_sup/deviasi harus tetap.
++        target = np.array((0.2, 0.1, np.radians(70.0)))
++        # Sensor disimulasikan dengan model tanpa batas sendi.
++        unlimited = WristFixture(seed=5)
++        unlimited.model.jnt_limited[:] = 0
++        mapped = mapper.map_frame(unlimited.sensors(target))
++        flex_id = mapper.qpos_ids[2]
++        self.assertAlmostEqual(mapped[flex_id], mapper.upper[2], places=3)
++        self.assertTrue(mapper.saturated[2])
++        np.testing.assert_allclose(mapped[mapper.qpos_ids[:2]], target[:2], atol=np.radians(0.2))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/calibrate_wrist_axes.py b/tools/calibrate_wrist_axes.py
+new file mode 100644
+index 0000000..7f9296b
+--- /dev/null
++++ b/tools/calibrate_wrist_axes.py
+@@ -0,0 +1,124 @@
++"""Estimasi sumbu anatomis wrist di frame sensor dari rekaman sapuan gerak.
++
++Contoh (memakai capture yang sudah ada di repo):
++
++    python tools/calibrate_wrist_axes.py \
++        --flexion smartglove_capture_atas_bawah \
++        --deviation smartglove_capture_kanan_kiri \
++        --pronation smartglove_capture_putar
++
++Tiap rekaman = folder berisi packet_*.bin (paket UDP 624 byte). Gerakkan
++HANYA satu sumbu per rekaman, lengan bawah diam, mulai dari pose netral.
++Hasil disimpan ke smartglove/wrist_axes.json per urutan quaternion.
++
++Tanda sumbu: sisi simpangan terbesar dianggap positif. Itu sesuai arah sendi
++model untuk deviasi (ulnar positif, ROM model -10..+25 derajat), tetapi untuk
++fleksi dan pronasi tanda tidak dapat ditentukan dari data; verifikasi sekali
++secara visual di viewer, lalu balik dengan --flip-flexion / --flip-pronation.
++"""
++
++import argparse
++import glob
++import sys
++from pathlib import Path
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from smartglove.quaternion import sensor_quaternion_to_wxyz  # noqa: E402
++from smartglove.wrist_alignment import (  # noqa: E402
++    DEFAULT_AXES_FILE,
++    axes_quality,
++    predicted_pro_sup_axis,
++    principal_axis,
++    save_axes,
++    sweep_rotvecs,
++)
++from smartglove_realtime import parse_packet_with_error  # noqa: E402
++
++
++def load_sweep(folder: str, order: str):
++    forearm, hand = [], []
++    for path in sorted(glob.glob(str(Path(folder) / "packet_*.bin"))):
++        parsed, _ = parse_packet_with_error(Path(path).read_bytes())
++        if parsed is None:
++            continue
++        forearm.append(sensor_quaternion_to_wxyz(parsed["FOREARM"]["quaternion"], order))
++        hand.append(sensor_quaternion_to_wxyz(parsed["HAND"]["quaternion"], order))
++    if len(hand) < 20:
++        raise SystemExit(f"{folder}: hanya {len(hand)} paket valid (minimal 20).")
++    return forearm, hand
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
++    parser.add_argument("--flexion", required=True, help="Folder sapuan fleksi/ekstensi.")
++    parser.add_argument("--deviation", required=True, help="Folder sapuan deviasi radial/ulnar.")
++    parser.add_argument(
++        "--pronation",
++        help="Folder sapuan pronasi/supinasi (opsional; hanya pengecekan silang).",
++    )
++    parser.add_argument("--order", choices=("xyzw", "wxyz"), default="xyzw")
++    parser.add_argument("--out", default=str(DEFAULT_AXES_FILE))
++    parser.add_argument("--flip-flexion", action="store_true")
++    parser.add_argument("--flip-deviation", action="store_true")
++    parser.add_argument("--flip-pronation", action="store_true")
++    args = parser.parse_args()
++
++    sources = {"flexion": args.flexion, "deviation": args.deviation}
++    if args.pronation:
++        sources["pro_sup"] = args.pronation
++    flips = {
++        "flexion": args.flip_flexion,
++        "deviation": args.flip_deviation,
++        "pro_sup": args.flip_pronation,
++    }
++
++    axes = {}
++    for name, folder in sources.items():
++        forearm, hand = load_sweep(folder, args.order)
++        info = principal_axis(sweep_rotvecs(forearm, hand))
++        if flips[name]:
++            info["axis"] = -info["axis"]
++            info["min_deg"], info["max_deg"] = -info["max_deg"], -info["min_deg"]
++        axes[name] = info
++        a = info["axis"]
++        print(
++            f"{name:<10} sumbu=[{a[0]:+.3f} {a[1]:+.3f} {a[2]:+.3f}] "
++            f"kemurnian={info['explained'] * 100:5.1f}% "
++            f"simpangan={info['min_deg']:+6.1f}..{info['max_deg']:+6.1f} deg"
++        )
++        if info["explained"] < 0.9:
++            print(f"  [PERINGATAN] {name}: gerak tidak satu-sumbu (<90%); ulangi rekaman.")
++
++    flexion_deviation = axes_quality(
++        {"flexion": axes["flexion"]["axis"], "deviation": axes["deviation"]["axis"]}
++    )["flexion-deviation"]
++    error = abs(flexion_deviation - 90.0)
++    print(
++        f"Sudut fleksi-deviasi terukur: {flexion_deviation:.1f} deg (ideal 90; "
++        f"selisih {error:.1f}). Sumbu fleksi dipetakan eksak, deviasi dikoreksi "
++        "ke tegak lurus."
++    )
++    if error > 20.0:
++        print("  [PERINGATAN] selisih >20 deg: rekaman deviasi kemungkinan "
++              "bercampur fleksi/pronasi; ulangi dengan lengan bawah diam.")
++
++    if "pro_sup" in axes:
++        predicted = predicted_pro_sup_axis(
++            {"flexion": axes["flexion"]["axis"], "deviation": axes["deviation"]["axis"]}
++        )
++        measured = axes["pro_sup"]["axis"]
++        cosine = abs(float(np.dot(predicted, measured)))
++        print(
++            "Pengecekan silang pronasi: sudut sumbu terukur vs prediksi = "
++            f"{np.degrees(np.arccos(np.clip(cosine, 0, 1))):.1f} deg (baik bila < 20)"
++        )
++
++    save_axes(Path(args.out), args.order, axes)
++    print(f"[OK] Disimpan ke {args.out} (urutan quaternion: {args.order})")
++
++
++if __name__ == "__main__":
++    main()

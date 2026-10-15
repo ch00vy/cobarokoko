@@ -144,3 +144,35 @@ def sensor_quaternion_to_wxyz(
     if order == "wxyz":
         return normalize_quaternion(values)
     raise ValueError(f"Urutan quaternion tidak didukung: {order}")
+
+
+def quaternion_to_rotvec(quaternion: np.ndarray) -> np.ndarray:
+    """Quaternion (wxyz) -> rotation vector (rad), sudut selalu dalam [0, pi]."""
+    q = normalize_quaternion(quaternion)
+    if q[0] < 0.0:
+        q = -q
+    vector_norm = float(np.linalg.norm(q[1:]))
+    if vector_norm < 1e-12:
+        return 2.0 * q[1:]
+    return q[1:] * (2.0 * math.atan2(vector_norm, float(q[0])) / vector_norm)
+
+
+def rotvec_to_quaternion(rotvec: np.ndarray) -> np.ndarray:
+    """Rotation vector (rad) -> quaternion (wxyz)."""
+    v = np.asarray(rotvec, dtype=float)
+    angle = float(np.linalg.norm(v))
+    if angle < 1e-12:
+        return normalize_quaternion((1.0, *(0.5 * v)))
+    half = 0.5 * angle
+    return np.concatenate(([math.cos(half)], v / angle * math.sin(half)))
+
+
+def quaternion_to_matrix(quaternion: np.ndarray) -> np.ndarray:
+    w, x, y, z = normalize_quaternion(quaternion)
+    return np.array(
+        (
+            (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+            (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
+            (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
+        )
+    )

@@ -64,7 +64,7 @@ def run(
         data.qvel[:] = 0.0
         mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
         mapper = HandQposMapper(model, data, flexion_gain)
-        wrist_mapper = WristQposMapper(model, data)
+        wrist_mapper = WristQposMapper(model, data, quaternion_order)
         muscle_controller = SmartGloveMuscleController(
             model,
             data,
@@ -229,8 +229,10 @@ def run(
                     finger: sensor_quaternions[finger]
                     for finger in FINGER_JOINTS
                 }
+                # Pergelangan dipetakan lebih dulu agar IK jari (abduksi) melihat
+                # pose wrist pada frame yang sama, bukan frame sebelumnya.
+                wrist_mapper.map_frame(sensor_quaternions)
                 qpos = mapper.map_frame(finger_quaternions)
-                qpos = wrist_mapper.map_frame(sensor_quaternions)
                 muscle_controller.update(qpos)
 
                 if last_packet_time is not None:
@@ -246,10 +248,19 @@ def run(
                         f"{np.round(np.degrees([qpos[mapper.fingers[finger]['qpos'][slot]] for slot in mapper.fingers[finger]['flexion_slots']])).astype(int).tolist()}"
                         for finger in FINGER_JOINTS
                     )
+                    wrist_text = " ".join(
+                        f"{name}:{angle:+.0f}{'*' if saturated else ''}"
+                        for name, angle, saturated in zip(
+                            ("ps", "dev", "flex"),
+                            wrist_mapper.last_angles_deg,
+                            wrist_mapper.saturated,
+                        )
+                    )
                     print(
                         f"Frame {frame_number:>7} | "
                         f"Rate {rate:5.1f} Hz | "
-                        f"fleksi MCP/PIP/DIP (thumb CMC/MP/IP): {finger_flexion}",
+                        f"fleksi MCP/PIP/DIP (thumb CMC/MP/IP): {finger_flexion} | "
+                        f"wrist deg (* = di batas ROM) {wrist_text}",
                         end="\r",
                     )
                     print()

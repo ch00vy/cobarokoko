@@ -3,7 +3,7 @@ import struct
 from pathlib import Path
 import time
 
-HOST = "0.0.0.0"
+HOST = "192.168.3.101"
 PORT = 14041
 
 N_PACKETS = 200

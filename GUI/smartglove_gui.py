@@ -858,10 +858,11 @@ class SmartGloveGUI:
         finger_quaternions = {
             finger: filtered[finger] for finger in FINGER_JOINTS
         }
-        qpos = self.mapper.map_frame(finger_quaternions)
         if self.wrist_mapper is None:
             raise RuntimeError("Mapper pergelangan belum siap.")
-        qpos = self.wrist_mapper.map_frame(filtered)
+        # Wrist lebih dulu agar IK jari memakai pose wrist frame yang sama.
+        self.wrist_mapper.map_frame(filtered)
+        qpos = self.mapper.map_frame(finger_quaternions)
         target_activations = self.muscle_controller.update(qpos)
         if self.fatigue_model is None:
             raise RuntimeError("Model fatigue belum siap.")

@@ -1,0 +1,149 @@
+import importlib
+import math
+import unittest
+
+import gymnasium as gym
+import mujoco
+import numpy as np
+
+from smartglove.config import ENV_NAME
+from smartglove.quaternion import quaternion_multiply
+from smartglove.wrist_mapping import (
+    WRIST_OUTPUT_CALIBRATIONS,
+    WRIST_RANGE_FRACTION,
+    WristQposMapper,
+)
+from smartglove_realtime import parse_packet_with_error
+
+importlib.import_module("myosuite")
+
+
+class WristMappingTests(unittest.TestCase):
+    def test_parser_reads_wrist_sensor_records(self) -> None:
+        packet = bytearray(624)
+        records = {
+            0x28: 0x00010000,
+            0x48: 0x00000100,
+            0x68: 0x00010200,
+            0x88: 0x00000300,
+            0xA8: 0x00000400,
+            0xC8: 0x01010500,
+            0xE8: 0x00000600,
+        }
+        for offset, identifier in records.items():
+            packet[offset : offset + 32] = (
+                identifier.to_bytes(4, "little")
+                + np.array(
+                    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+                    dtype="<f4",
+                ).tobytes()
+            )
+
+        parsed, error = parse_packet_with_error(bytes(packet))
+
+        self.assertIsNone(error)
+        if parsed is None:
+            self.fail("A packet with seven valid sensor records was rejected.")
+        self.assertEqual(
+            set(parsed),
+            {"THUMB", "INDEX", "MIDDLE", "RING", "PINKY", "FOREARM", "HAND"},
+        )
+
+    def test_wrist_mapper_maps_capture_axes_with_conservative_range(self) -> None:
+        env = gym.make(ENV_NAME)
+        try:
+            unwrapped = env.unwrapped
+            model = getattr(unwrapped, "mj_model")
+            data = getattr(unwrapped, "mj_data")
+            data.qpos[:] = getattr(unwrapped, "init_qpos")
+            data.qvel[:] = 0.0
+            mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
+            mapper = WristQposMapper(model, data)
+            neutral_forearm = np.array((1.0, 0.0, 0.0, 0.0))
+            neutral_hand = np.array((1.0, 0.0, 0.0, 0.0))
+            mapper.calibrate(neutral_forearm, neutral_hand)
+
+            qpos_ids = mapper.qpos_ids
+            neutral_qpos = data.qpos.copy()
+            neutral_result = mapper.map_frame(
+                {
+                    "FOREARM": neutral_forearm,
+                    "HAND": neutral_hand,
+                }
+            )
+            np.testing.assert_allclose(
+                neutral_result[qpos_ids],
+                neutral_qpos[qpos_ids],
+                atol=1e-3,
+            )
+
+            for index, (joint_name, calibration) in enumerate(
+                WRIST_OUTPUT_CALIBRATIONS.items()
+            ):
+                weights = mapper.sensor_weights[joint_name]
+                for direction in (-1.0, 1.0):
+                    extent = (
+                        calibration.negative_range
+                        if direction < 0.0
+                        else calibration.positive_range
+                    )
+                    signal = direction * (
+                        calibration.deadband
+                        + (extent - calibration.deadband) * 0.5
+                    )
+                    feature = weights * signal / float(np.dot(weights, weights))
+                    forearm_rotation = feature[:3]
+                    hand_rotation = feature[3:]
+                    forearm_angle = float(np.linalg.norm(forearm_rotation))
+                    hand_angle = float(np.linalg.norm(hand_rotation))
+                    forearm_delta = np.concatenate(
+                        (
+                            np.array((math.cos(forearm_angle / 2.0),)),
+                            forearm_rotation
+                            * math.sin(forearm_angle / 2.0)
+                            / forearm_angle,
+                        )
+                    )
+                    hand_delta = np.concatenate(
+                        (
+                            np.array((math.cos(hand_angle / 2.0),)),
+                            hand_rotation
+                            * math.sin(hand_angle / 2.0)
+                            / hand_angle,
+                        )
+                    )
+                    sensor_orientations = {
+                        "FOREARM": quaternion_multiply(
+                            neutral_forearm,
+                            forearm_delta,
+                        ),
+                        "HAND": quaternion_multiply(
+                            neutral_hand,
+                            hand_delta,
+                        ),
+                    }
+
+                    mapped_qpos = mapper.map_frame(sensor_orientations)
+                    if direction > 0.0:
+                        expected = neutral_qpos[qpos_ids[index]] + (
+                            mapper.upper[index] - neutral_qpos[qpos_ids[index]]
+                        ) * WRIST_RANGE_FRACTION * 0.5
+                    else:
+                        expected = neutral_qpos[qpos_ids[index]] - (
+                            neutral_qpos[qpos_ids[index]] - mapper.lower[index]
+                        ) * WRIST_RANGE_FRACTION * 0.5
+                    self.assertAlmostEqual(
+                        mapped_qpos[qpos_ids[index]],
+                        expected,
+                        places=3,
+                    )
+                    self.assertLessEqual(
+                        mapped_qpos[qpos_ids[index]],
+                        mapper.upper[index],
+                    )
+                    self.assertGreaterEqual(
+                        mapped_qpos[qpos_ids[index]],
+                        mapper.lower[index],
+                    )
+        finally:
+            env.close()

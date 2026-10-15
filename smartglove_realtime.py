@@ -45,12 +45,31 @@ FINGER_IDS = {
 }
 
 FINGER_ID_ALIASES = {
+    0x00010000: "THUMB",
     0x02000000: "THUMB",
     0x03000000: "THUMB",
     0x03010000: "THUMB",
     0x00010200: "MIDDLE",
     0x01000300: "RING",
 }
+
+# Byte ke-1 (bit 8-15) dari ID record adalah indeks sensor yang stabil:
+# 0=THUMB 1=INDEX 2=MIDDLE 3=RING 4=PINKY 5=FOREARM 6=HAND. Byte lainnya
+# berubah-ubah (mis. 0x03010000, 0x01010500) sehingga tabel alias ID penuh
+# tidak andal. Terverifikasi pada 2800 paket capture di repo ini.
+SENSOR_INDEX = {
+    "THUMB": 0,
+    "INDEX": 1,
+    "MIDDLE": 2,
+    "RING": 3,
+    "PINKY": 4,
+    "FOREARM": 5,
+    "HAND": 6,
+}
+
+
+def sensor_index_from_id(record_id: int) -> int:
+    return (record_id >> 8) & 0xFF
 
 
 # ============================================================
@@ -107,49 +126,35 @@ def parse_packet(data):
 
 
 def parse_packet_with_error(data):
-    """Parse a packet and return a reason when its contents are invalid."""
+    """Parse a packet and return a reason when its contents are invalid.
+
+    Setiap slot (offset) harus membawa indeks sensor yang sesuai dengan
+    posisinya, termasuk FOREARM dan HAND yang sebelumnya tidak divalidasi.
+    """
     if len(data) != PACKET_SIZE:
         return None, f"ukuran {len(data)} bytes (diharapkan {PACKET_SIZE})"
 
-    finger_by_id = {finger_id: finger for finger, finger_id in FINGER_IDS.items()}
-    finger_by_id.update(FINGER_ID_ALIASES)
     result = {}
+    slots = {**FINGERS, **WRIST_SENSORS}
 
-    for offset in FINGERS.values():
+    for sensor, offset in slots.items():
         parsed = parse_finger(data, offset)
 
         if parsed is None:
-            finger_id = struct.unpack_from("<I", data, offset)[0]
-            return None, (
-                f"quaternion tidak valid pada record offset 0x{offset:02X} "
-                f"(ID 0x{finger_id:08X})"
-            )
-
-        finger = finger_by_id.get(parsed["id"])
-        if finger is None:
-            return None, (
-                f"ID jari tidak dikenal 0x{parsed['id']:08X} "
-                f"pada record offset 0x{offset:02X}"
-            )
-        if finger in result:
-            return None, (
-                f"ID jari {finger} duplikat pada record offset 0x{offset:02X}"
-            )
-
-        result[finger] = parsed
-
-    if len(result) != len(FINGER_IDS):
-        missing = sorted(set(FINGER_IDS) - result.keys())
-        return None, f"record jari tidak ditemukan: {', '.join(missing)}"
-
-    for sensor, offset in WRIST_SENSORS.items():
-        parsed = parse_finger(data, offset)
-        if parsed is None:
-            sensor_id = struct.unpack_from("<I", data, offset)[0]
+            record_id = struct.unpack_from("<I", data, offset)[0]
             return None, (
                 f"quaternion tidak valid pada sensor {sensor} "
-                f"offset 0x{offset:02X} (ID 0x{sensor_id:08X})"
+                f"offset 0x{offset:02X} (ID 0x{record_id:08X})"
             )
+
+        index = sensor_index_from_id(parsed["id"])
+        if index != SENSOR_INDEX[sensor]:
+            return None, (
+                f"ID 0x{parsed['id']:08X} pada offset 0x{offset:02X} membawa "
+                f"indeks sensor {index}, diharapkan {SENSOR_INDEX[sensor]} "
+                f"({sensor})"
+            )
+
         result[sensor] = parsed
 
     return result, None
