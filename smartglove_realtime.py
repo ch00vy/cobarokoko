@@ -160,6 +160,26 @@ def parse_packet_with_error(data):
     return result, None
 
 
+HEADER_SIZE = 0x28
+
+
+def parse_packet_header(data):
+    """Baca penghitung milik glove dari header 40 byte.
+
+    Hasil analisis capture (200 paket): u32 di offset 0x20 naik tepat 12 per
+    paket (dugaan: tick/timestamp; satuan belum terverifikasi) dan u32 di
+    offset 0x24 naik tepat 1 per paket (penghitung urut). Field header lain
+    belum diketahui artinya dan tidak dipakai.
+
+    Mengembalikan (glove_tick, glove_seq), atau (None, None) bila paket terlalu
+    pendek. Tidak memvalidasi isi paket; gunakan parse_packet_with_error.
+    """
+    if len(data) < HEADER_SIZE:
+        return None, None
+    tick, seq = struct.unpack_from("<II", data, 0x20)
+    return tick, seq
+
+
 def calculate_packet_rate(intervals):
     elapsed = sum(intervals)
     return len(intervals) / elapsed if elapsed > 0 else 0.0

@@ -1,7 +1,10 @@
+import contextlib
 import importlib
 import socket
 import time
 from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import gymnasium as gym
 import mujoco
@@ -9,23 +12,43 @@ import mujoco.viewer
 import numpy as np
 
 from control.smartglove_muscle_control import SmartGloveMuscleController
-from smartglove.config import CALIBRATION_PACKETS, ENV_NAME, FINGER_JOINTS
+from smartglove.calibration import CalibrationSession, frame_quaternions
+from smartglove.config import (
+    CALIBRATION_PACKETS,
+    DISTAL_COUPLING,
+    ENV_NAME,
+    FILTER_CUTOFF_HZ,
+    FINGER_JOINTS,
+    IK_ITERATIONS,
+)
+from smartglove.frame import Event, RecordingError, frame_from_parsed
 from smartglove.mapping import HandQposMapper
 from smartglove.quaternion import (
     QuaternionLowPassFilter,
-    average_quaternions,
     sensor_quaternion_to_wxyz,
 )
+from smartglove.recorder import (
+    JsonlRecorder,
+    build_meta,
+    describe_axes_file,
+    read_recording,
+)
+from smartglove.wrist_alignment import DEFAULT_AXES_FILE
 from smartglove.wrist_mapping import WristQposMapper
 from smartglove_realtime import (
     HOST,
     PORT,
     RATE_WINDOW_INTERVALS,
     calculate_packet_rate,
+    parse_packet_header,
     parse_packet_with_error,
 )
 
 importlib.import_module("myosuite")
+
+# Selisih maksimum (per komponen quaternion) yang masih dianggap sama saat
+# membandingkan kalibrasi hasil hitung ulang dengan yang tersimpan di rekaman.
+CALIBRATION_MATCH_TOLERANCE = 1e-9
 
 
 def drain_udp_queue(sock: socket.socket) -> bytes | None:
@@ -49,33 +72,133 @@ def capture_sensor_quaternions(parsed: dict, order: str) -> dict[str, np.ndarray
     }
 
 
+# ---------------------------------------------------------------- pipeline
+
+
+@dataclass
+class Pipeline:
+    model: object
+    data: object
+    mapper: HandQposMapper
+    wrist_mapper: WristQposMapper
+    muscle_controller: SmartGloveMuscleController
+    quaternion_filter: QuaternionLowPassFilter
+    calibration: CalibrationSession
+
+
+def build_pipeline(
+    env,
+    quaternion_order: str,
+    flexion_gain: float,
+    filter_cutoff_hz: float,
+    emit=None,
+) -> Pipeline:
+    unwrapped = env.unwrapped
+    model = getattr(unwrapped, "mj_model")
+    data = getattr(unwrapped, "mj_data")
+    data.qpos[:] = getattr(unwrapped, "init_qpos")
+    data.qvel[:] = 0.0
+    mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
+    mapper = HandQposMapper(model, data, flexion_gain)
+    wrist_mapper = WristQposMapper(model, data, quaternion_order)
+    muscle_controller = SmartGloveMuscleController(model, data, FINGER_JOINTS)
+    quaternion_filter = QuaternionLowPassFilter(filter_cutoff_hz)
+    calibration = CalibrationSession(
+        mapper, wrist_mapper, quaternion_filter, quaternion_order, emit=emit
+    )
+    return Pipeline(
+        model, data, mapper, wrist_mapper, muscle_controller,
+        quaternion_filter, calibration,
+    )
+
+
+def map_frame(pipeline: Pipeline, quats: dict[str, np.ndarray], t: float) -> np.ndarray:
+    """Langkah per-frame yang sama untuk live dan replay: filter -> wrist -> jari -> otot."""
+    filtered = pipeline.quaternion_filter.update(quats, t)
+    finger_quaternions = {finger: filtered[finger] for finger in FINGER_JOINTS}
+    # Pergelangan dipetakan lebih dulu agar IK jari (abduksi) melihat
+    # pose wrist pada frame yang sama, bukan frame sebelumnya.
+    pipeline.wrist_mapper.map_frame(filtered)
+    qpos = pipeline.mapper.map_frame(finger_quaternions)
+    pipeline.muscle_controller.update(qpos)
+    return qpos
+
+
+def format_status(
+    frame_number: int, rate: float, qpos: np.ndarray, pipeline: Pipeline
+) -> str:
+    mapper, wrist_mapper = pipeline.mapper, pipeline.wrist_mapper
+    finger_flexion = " | ".join(
+        f"{finger}:"
+        f"{np.round(np.degrees([qpos[mapper.fingers[finger]['qpos'][slot]] for slot in mapper.fingers[finger]['flexion_slots']])).astype(int).tolist()}"
+        for finger in FINGER_JOINTS
+    )
+    wrist_text = " ".join(
+        f"{name}:{angle:+.0f}{'*' if saturated else ''}"
+        for name, angle, saturated in zip(
+            ("ps", "dev", "flex"),
+            wrist_mapper.last_angles_deg,
+            wrist_mapper.saturated,
+        )
+    )
+    return (
+        f"Frame {frame_number:>7} | "
+        f"Rate {rate:5.1f} Hz | "
+        f"fleksi MCP/PIP/DIP (thumb CMC/MP/IP): {finger_flexion} | "
+        f"wrist deg (* = di batas ROM) {wrist_text}"
+    )
+
+
+def session_params(flexion_gain: float, filter_cutoff_hz: float) -> dict:
+    return {
+        "env": ENV_NAME,
+        "flexion_gain": flexion_gain,
+        "filter_cutoff_hz": filter_cutoff_hz,
+        "calibration_packets": CALIBRATION_PACKETS,
+        "ik_iterations": IK_ITERATIONS,
+        "distal_coupling": DISTAL_COUPLING,
+    }
+
+
+# -------------------------------------------------------------------- live
+
+
 def run(
     quaternion_order: str,
     flexion_gain: float,
     filter_cutoff_hz: float,
+    record_path: str | Path | None = None,
 ) -> None:
     env = gym.make(ENV_NAME)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    recorder: JsonlRecorder | None = None
     try:
-        unwrapped = env.unwrapped
-        model = getattr(unwrapped, "mj_model")
-        data = getattr(unwrapped, "mj_data")
-        data.qpos[:] = getattr(unwrapped, "init_qpos")
-        data.qvel[:] = 0.0
-        mujoco.mj_forward(model, data)  # type: ignore[attr-defined]
-        mapper = HandQposMapper(model, data, flexion_gain)
-        wrist_mapper = WristQposMapper(model, data, quaternion_order)
-        muscle_controller = SmartGloveMuscleController(
-            model,
-            data,
-            FINGER_JOINTS,
+        if record_path is not None:
+            recorder = JsonlRecorder(
+                record_path,
+                build_meta(
+                    quat_order=quaternion_order,
+                    source=f"{HOST}:{PORT}",
+                    params=session_params(flexion_gain, filter_cutoff_hz),
+                    axes_file=DEFAULT_AXES_FILE,
+                ),
+            )
+        pipeline = build_pipeline(
+            env,
+            quaternion_order,
+            flexion_gain,
+            filter_cutoff_hz,
+            emit=recorder.write_event if recorder is not None else None,
         )
-        quaternion_filter = QuaternionLowPassFilter(filter_cutoff_hz)
+        model, data = pipeline.model, pipeline.data
+        calibration = pipeline.calibration
 
-        print(f"[OK] MyoSuite model : {ENV_NAME} (nq={model.nq})")
-        print(f"[OK] Muscle control: {model.nu} actuator aktif di viewer")
+        print(f"[OK] MyoSuite model : {ENV_NAME} (nq={model.nq})")  # type: ignore[attr-defined]
+        print(f"[OK] Muscle control: {model.nu} actuator aktif di viewer")  # type: ignore[attr-defined]
         print(f"[OK] Flexion gain  : {flexion_gain:.2f}x")
         print(f"[OK] Filter cutoff : {filter_cutoff_hz:.1f} Hz")
+        if recorder is not None:
+            print(f"[OK] Rekaman JSONL : {recorder.path}")
         print(
             "Atur glove ke pose netral yang ingin dianggap sebagai tangan terbuka: "
             "jari lurus, ibu jari terbuka, pergelangan rileks."
@@ -92,17 +215,12 @@ def run(
             f"Kalibrasi {CALIBRATION_PACKETS} paket..."
         )
 
-        calibration_samples = {finger: [] for finger in FINGER_JOINTS}
-        wrist_calibration_samples = {
-            sensor: [] for sensor in ("FOREARM", "HAND")
-        }
-        grip_calibration_samples = {finger: [] for finger in FINGER_JOINTS}
         packet_intervals = deque(maxlen=RATE_WINDOW_INTERVALS)
         last_packet_time = None
         frame_number = 0
         last_status_time = 0.0
-        calibrated = False
-        grip_calibrated = False
+        session_start = time.perf_counter()
+        calibration.start_open(0, 0.0)
 
         with mujoco.viewer.launch_passive(model, data) as viewer:
             while viewer.is_running():
@@ -124,24 +242,25 @@ def run(
                     )
                     continue
 
-                sensor_quaternions = capture_sensor_quaternions(
-                    parsed,
-                    quaternion_order,
-                )
                 frame_number += 1
+                glove_tick, glove_seq = parse_packet_header(packet)
+                frame = frame_from_parsed(
+                    parsed,
+                    frame_number,
+                    now - session_start,
+                    glove_seq=glove_seq,
+                    glove_tick=glove_tick,
+                )
+                if recorder is not None:
+                    recorder.write_frame(frame)
+                sensor_quaternions = frame_quaternions(frame, quaternion_order)
 
-                if not calibrated:
-                    for finger, quaternion in sensor_quaternions.items():
-                        if finger in calibration_samples:
-                            calibration_samples[finger].append(quaternion)
-                        elif finger in wrist_calibration_samples:
-                            wrist_calibration_samples[finger].append(quaternion)
-
-                    sample_count = len(calibration_samples["THUMB"])
-                    if sample_count < CALIBRATION_PACKETS:
+                if calibration.phase == "open":
+                    result = calibration.feed(frame, sensor_quaternions)
+                    if result == "collecting_open":
                         if now - last_status_time >= 0.5:
                             print(
-                                f"[CALIBRATION] {sample_count}/"
+                                f"[CALIBRATION] {calibration.sample_count}/"
                                 f"{CALIBRATION_PACKETS} paket netral",
                                 end="\r",
                             )
@@ -149,24 +268,6 @@ def run(
                         viewer.sync()
                         continue
 
-                    sensor_neutral = {
-                        finger: average_quaternions(samples)
-                        for finger, samples in calibration_samples.items()
-                    }
-                    mapper.calibrate(sensor_neutral)
-                    sensor_wrist_neutral = {
-                        sensor: average_quaternions(samples)
-                        for sensor, samples in wrist_calibration_samples.items()
-                    }
-                    wrist_mapper.calibrate(
-                        sensor_wrist_neutral["FOREARM"],
-                        sensor_wrist_neutral["HAND"],
-                    )
-                    quaternion_filter.reset(
-                        {**sensor_neutral, **sensor_wrist_neutral},
-                        now,
-                    )
-                    calibrated = True
                     print("\n[OK] Pose terbuka tersimpan.")
                     input(
                         "Sekarang genggam tangan dengan nyaman, tahan posisi, "
@@ -174,18 +275,15 @@ def run(
                     )
                     drain_udp_queue(sock)
                     last_status_time = 0.0
+                    calibration.start_grip(frame.n, frame.t)
                     continue
 
-                if not grip_calibrated:
-                    for finger, quaternion in sensor_quaternions.items():
-                        if finger in grip_calibration_samples:
-                            grip_calibration_samples[finger].append(quaternion)
-
-                    sample_count = len(grip_calibration_samples["THUMB"])
-                    if sample_count < CALIBRATION_PACKETS:
+                if calibration.phase == "grip":
+                    result = calibration.feed(frame, sensor_quaternions)
+                    if result == "collecting_grip":
                         if now - last_status_time >= 0.5:
                             print(
-                                f"[CALIBRATION GRIP] {sample_count}/"
+                                f"[CALIBRATION GRIP] {calibration.sample_count}/"
                                 f"{CALIBRATION_PACKETS} paket genggam",
                                 end="\r",
                             )
@@ -193,47 +291,25 @@ def run(
                         viewer.sync()
                         continue
 
-                    sensor_grip = {
-                        finger: average_quaternions(samples)
-                        for finger, samples in grip_calibration_samples.items()
-                    }
-                    try:
-                        skipped_fingers = mapper.calibrate_grip(sensor_grip)
-                    except ValueError as error:
-                        print(f"\n[WARNING] Kalibrasi genggam gagal: {error}")
+                    if result == "grip_failed":
+                        print(f"\n[WARNING] Kalibrasi genggam gagal: {calibration.last_error}")
                         input(
                             "Atur ulang genggaman, tahan, lalu tekan Enter "
                             "untuk mencoba lagi..."
                         )
                         drain_udp_queue(sock)
-                        grip_calibration_samples = {
-                            finger: [] for finger in FINGER_JOINTS
-                        }
                         last_status_time = 0.0
+                        calibration.start_grip(frame.n, frame.t)
                         continue
 
-                    for finger in skipped_fingers:
+                    for finger in calibration.skipped_fingers:
                         print(
                             f"[WARNING] Kalibrasi genggam {finger} tidak menangkap "
                             "perubahan; jari ini tetap menggunakan IK."
                         )
-                    quaternion_filter.reset(sensor_quaternions, now)
-                    grip_calibrated = True
                     print("\n[OK] Kalibrasi terbuka dan genggam selesai.")
 
-                sensor_quaternions = quaternion_filter.update(
-                    sensor_quaternions,
-                    now,
-                )
-                finger_quaternions = {
-                    finger: sensor_quaternions[finger]
-                    for finger in FINGER_JOINTS
-                }
-                # Pergelangan dipetakan lebih dulu agar IK jari (abduksi) melihat
-                # pose wrist pada frame yang sama, bukan frame sebelumnya.
-                wrist_mapper.map_frame(sensor_quaternions)
-                qpos = mapper.map_frame(finger_quaternions)
-                muscle_controller.update(qpos)
+                qpos = map_frame(pipeline, sensor_quaternions, frame.t)
 
                 if last_packet_time is not None:
                     interval = now - last_packet_time
@@ -243,26 +319,7 @@ def run(
 
                 if now - last_status_time >= 0.5:
                     rate = calculate_packet_rate(packet_intervals)
-                    finger_flexion = " | ".join(
-                        f"{finger}:"
-                        f"{np.round(np.degrees([qpos[mapper.fingers[finger]['qpos'][slot]] for slot in mapper.fingers[finger]['flexion_slots']])).astype(int).tolist()}"
-                        for finger in FINGER_JOINTS
-                    )
-                    wrist_text = " ".join(
-                        f"{name}:{angle:+.0f}{'*' if saturated else ''}"
-                        for name, angle, saturated in zip(
-                            ("ps", "dev", "flex"),
-                            wrist_mapper.last_angles_deg,
-                            wrist_mapper.saturated,
-                        )
-                    )
-                    print(
-                        f"Frame {frame_number:>7} | "
-                        f"Rate {rate:5.1f} Hz | "
-                        f"fleksi MCP/PIP/DIP (thumb CMC/MP/IP): {finger_flexion} | "
-                        f"wrist deg (* = di batas ROM) {wrist_text}",
-                        end="\r",
-                    )
+                    print(format_status(frame_number, rate, qpos, pipeline), end="\r")
                     print()
                     last_status_time = now
 
@@ -270,5 +327,189 @@ def run(
     except KeyboardInterrupt:
         print("\n[STOP] Smartglove MuJoCo dihentikan.")
     finally:
+        if recorder is not None:
+            recorder.close()
         sock.close()
         env.close()
+
+
+# ------------------------------------------------------------------ replay
+
+
+@dataclass
+class ReplayResult:
+    qpos: np.ndarray
+    warnings: list[str] = field(default_factory=list)
+    frames_total: int = 0
+    frames_mapped: int = 0
+    meta: dict = field(default_factory=dict)
+
+
+def extract_stored_calibration(recording) -> tuple[dict, dict, int]:
+    """Payload kalibrasi buka dan genggam terakhir yang berhasil, plus nomor
+    frame penutup kalibrasi genggam (frame itu ikut dipetakan)."""
+    open_payload = grip_payload = None
+    resume_n = None
+    for event in recording.events:
+        if event.name == "calib_open_done":
+            open_payload = event.payload
+        elif event.name == "calib_grip_done" and event.payload.get("ok"):
+            grip_payload = event.payload
+            resume_n = event.n
+    if open_payload is None or grip_payload is None or resume_n is None:
+        raise RecordingError(
+            "rekaman tidak memuat event kalibrasi buka dan genggam yang berhasil"
+        )
+    return open_payload, grip_payload, resume_n
+
+
+def _compare_calibration(session: CalibrationSession, event: Event) -> str | None:
+    from smartglove.calibration import payload_max_difference
+
+    if event.name == "calib_open_done":
+        computed, key = session.last_open_payload, "neutral"
+    else:
+        computed, key = session.last_grip_payload, "grip"
+    if computed is None:
+        return (
+            f"{event.name} (frame {event.n}): frame kalibrasi tidak lengkap, "
+            "tidak bisa dibandingkan dengan nilai tersimpan"
+        )
+    if event.name == "calib_grip_done" and bool(computed.get("ok")) != bool(
+        event.payload.get("ok")
+    ):
+        return f"{event.name} (frame {event.n}): hasil berhasil/gagal berbeda dari rekaman"
+    difference = payload_max_difference(computed, event.payload, key)
+    if difference > CALIBRATION_MATCH_TOLERANCE:
+        return (
+            f"{event.name} (frame {event.n}): hasil hitung ulang berbeda dari rekaman "
+            f"(selisih maks {difference:.3g}); kode kalibrasi atau mapping berubah"
+        )
+    return None
+
+
+def replay(
+    path: str | Path,
+    *,
+    quaternion_order: str | None = None,
+    flexion_gain: float | None = None,
+    filter_cutoff_hz: float | None = None,
+    mode: str = "recompute",
+    calib_from: str | Path | None = None,
+    show_viewer: bool = True,
+    realtime: bool = True,
+) -> ReplayResult:
+    """Putar ulang rekaman JSONL lewat pipeline yang sama dengan sesi live.
+
+    mode="recompute": kalibrasi dihitung ulang dari frame kalibrasi di rekaman
+    (hasilnya dibandingkan dengan nilai tersimpan; selisih jadi peringatan).
+    mode="stored": memakai rata-rata quaternion yang tersimpan di event.
+    ``calib_from`` meminjam kalibrasi dari rekaman lain (otomatis mode stored).
+    """
+    if mode not in ("recompute", "stored"):
+        raise ValueError(f"mode replay tidak dikenal: {mode!r}")
+    recording = read_recording(path)
+    meta = recording.meta
+    params = meta.get("params") or {}
+    order = quaternion_order or meta["quat_order"]
+    gain = flexion_gain if flexion_gain is not None else params.get("flexion_gain", 1.0)
+    cutoff = (
+        filter_cutoff_hz
+        if filter_cutoff_hz is not None
+        else params.get("filter_cutoff_hz", FILTER_CUTOFF_HZ)
+    )
+    env_name = params.get("env", ENV_NAME)
+
+    warnings: list[str] = []
+    if recording.truncated:
+        warnings.append("baris terakhir rekaman terpotong dan dibuang")
+    recorded_axes = (meta.get("wrist_axes") or {}).get("sha256")
+    current_axes = (describe_axes_file(DEFAULT_AXES_FILE) or {}).get("sha256")
+    if recorded_axes and current_axes and recorded_axes != current_axes:
+        warnings.append(
+            "wrist_axes.json saat ini berbeda dari yang dipakai saat merekam; "
+            "hasil pemetaan wrist bisa berbeda"
+        )
+
+    use_stored = mode == "stored" or calib_from is not None
+    stored_open = stored_grip = None
+    resume_n = 0
+    if use_stored:
+        source = read_recording(calib_from) if calib_from is not None else recording
+        if source.meta["quat_order"] != order:
+            raise RecordingError(
+                "urutan quaternion rekaman sumber kalibrasi "
+                f"({source.meta['quat_order']}) berbeda dari replay ({order})"
+            )
+        stored_open, stored_grip, source_resume = extract_stored_calibration(source)
+        if calib_from is None:
+            resume_n = source_resume
+        else:
+            try:
+                resume_n = extract_stored_calibration(recording)[2]
+            except RecordingError:
+                resume_n = 0
+
+    env = gym.make(env_name)
+    try:
+        pipeline = build_pipeline(env, order, gain, cutoff)
+        session = pipeline.calibration
+        if use_stored:
+            session.apply_stored(stored_open, stored_grip)  # type: ignore[arg-type]
+
+        qpos_log: list[np.ndarray] = []
+        frames_total = 0
+        viewer_context = (
+            mujoco.viewer.launch_passive(pipeline.model, pipeline.data)
+            if show_viewer
+            else contextlib.nullcontext()
+        )
+        previous_t: float | None = None
+        with viewer_context as viewer:
+            for item in recording.items:
+                if viewer is not None and not viewer.is_running():
+                    break
+                if isinstance(item, Event):
+                    if use_stored:
+                        continue
+                    if item.name == "calib_open_start":
+                        session.start_open(item.n, item.t)
+                    elif item.name == "calib_grip_start":
+                        session.start_grip(item.n, item.t, item.payload.get("attempt"))
+                    elif item.name in ("calib_open_done", "calib_grip_done"):
+                        problem = _compare_calibration(session, item)
+                        if problem is not None:
+                            warnings.append(problem)
+                    continue
+
+                frames_total += 1
+                if use_stored and item.n < resume_n:
+                    continue
+                quats = frame_quaternions(item, order)
+                if session.phase in ("open", "grip"):
+                    if session.feed(item, quats) != "grip_done":
+                        continue
+                elif not session.ready:
+                    continue
+
+                qpos_log.append(map_frame(pipeline, quats, item.t))
+                if viewer is not None:
+                    if realtime and previous_t is not None:
+                        time.sleep(max(0.0, item.t - previous_t))
+                    previous_t = item.t
+                    viewer.sync()
+    finally:
+        env.close()
+
+    if not qpos_log:
+        raise RecordingError(
+            "tidak ada frame yang dipetakan: rekaman tidak memuat kalibrasi lengkap. "
+            "Gunakan calib_from untuk meminjam kalibrasi dari rekaman lain."
+        )
+    return ReplayResult(
+        qpos=np.array(qpos_log),
+        warnings=warnings,
+        frames_total=frames_total,
+        frames_mapped=len(qpos_log),
+        meta=meta,
+    )
