@@ -3,7 +3,7 @@ import importlib
 import socket
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import gymnasium as gym
@@ -21,7 +21,13 @@ from smartglove.config import (
     FINGER_JOINTS,
     IK_ITERATIONS,
 )
-from smartglove.frame import Event, RecordingError, frame_from_parsed
+from smartglove.frame import (
+    Event,
+    Frame,
+    RecordingError,
+    frame_from_parsed,
+    glove_time_seconds,
+)
 from smartglove.mapping import HandQposMapper
 from smartglove.quaternion import (
     QuaternionLowPassFilter,
@@ -63,6 +69,67 @@ def drain_udp_queue(sock: socket.socket) -> bytes | None:
     finally:
         sock.settimeout(0.01)
     return latest_packet
+
+
+def drain_udp_packets(sock: socket.socket) -> list[bytes]:
+    """Ambil SEMUA paket yang sedang mengantre, dari yang tertua ke terbaru."""
+    packets: list[bytes] = []
+    sock.setblocking(False)
+    try:
+        while True:
+            try:
+                packet, _ = sock.recvfrom(65535)
+            except BlockingIOError:
+                break
+            packets.append(packet)
+    finally:
+        sock.settimeout(0.01)
+    return packets
+
+
+class LiveCapture:
+    """Penomoran frame live dan penulisan rekaman.
+
+    mode "processed": hanya paket yang diproses mapper yang direkam.
+    mode "all": setiap paket valid yang dibaca direkam, termasuk paket yang
+    dibuang drain (ditandai ``proc: false``). Pemrosesan tidak berubah: tetap
+    paket terbaru dari tiap gelombang baca.
+    """
+
+    def __init__(self, recorder: JsonlRecorder | None, record_all: bool) -> None:
+        self.recorder = recorder
+        self.record_all = bool(record_all and recorder is not None)
+        self.frame_number = 0
+        self.processed = 0
+        self.invalid_skipped = 0
+
+    def record_unprocessed(self, packets: list[bytes], t: float) -> None:
+        if not self.record_all:
+            return
+        for packet in packets:
+            parsed, _ = parse_packet_with_error(packet)
+            if parsed is None:
+                self.invalid_skipped += 1
+                continue
+            self.frame_number += 1
+            glove_tick, glove_seq = parse_packet_header(packet)
+            self.recorder.write_frame(  # type: ignore[union-attr]
+                frame_from_parsed(
+                    parsed, self.frame_number, t,
+                    glove_seq=glove_seq, glove_tick=glove_tick, processed=False,
+                )
+            )
+
+    def new_frame(self, parsed: dict, packet: bytes, t: float) -> Frame:
+        self.frame_number += 1
+        self.processed += 1
+        glove_tick, glove_seq = parse_packet_header(packet)
+        frame = frame_from_parsed(
+            parsed, self.frame_number, t, glove_seq=glove_seq, glove_tick=glove_tick
+        )
+        if self.recorder is not None:
+            self.recorder.write_frame(frame)
+        return frame
 
 
 def capture_sensor_quaternions(parsed: dict, order: str) -> dict[str, np.ndarray]:
@@ -168,10 +235,15 @@ def run(
     flexion_gain: float,
     filter_cutoff_hz: float,
     record_path: str | Path | None = None,
+    record_all: bool = False,
 ) -> None:
+    if record_all and record_path is None:
+        raise ValueError("record_all membutuhkan record_path.")
     env = gym.make(ENV_NAME)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     recorder: JsonlRecorder | None = None
+    capture: LiveCapture | None = None
+    session_start: float | None = None
     try:
         if record_path is not None:
             recorder = JsonlRecorder(
@@ -181,8 +253,10 @@ def run(
                     source=f"{HOST}:{PORT}",
                     params=session_params(flexion_gain, filter_cutoff_hz),
                     axes_file=DEFAULT_AXES_FILE,
+                    capture="all" if record_all else "processed",
                 ),
             )
+        capture = LiveCapture(recorder, record_all)
         pipeline = build_pipeline(
             env,
             quaternion_order,
@@ -198,7 +272,8 @@ def run(
         print(f"[OK] Flexion gain  : {flexion_gain:.2f}x")
         print(f"[OK] Filter cutoff : {filter_cutoff_hz:.1f} Hz")
         if recorder is not None:
-            print(f"[OK] Rekaman JSONL : {recorder.path}")
+            mode_text = "semua paket" if record_all else "frame yang diproses"
+            print(f"[OK] Rekaman JSONL : {recorder.path} ({mode_text})")
         print(
             "Atur glove ke pose netral yang ingin dianggap sebagai tangan terbuka: "
             "jari lurus, ibu jari terbuka, pergelangan rileks."
@@ -217,7 +292,6 @@ def run(
 
         packet_intervals = deque(maxlen=RATE_WINDOW_INTERVALS)
         last_packet_time = None
-        frame_number = 0
         last_status_time = 0.0
         session_start = time.perf_counter()
         calibration.start_open(0, 0.0)
@@ -230,29 +304,22 @@ def run(
                     viewer.sync()
                     continue
 
-                latest_packet = drain_udp_queue(sock)
-                if latest_packet is not None:
-                    packet = latest_packet
+                queued = drain_udp_packets(sock)
+                earlier = [packet, *queued[:-1]] if queued else []
+                if queued:
+                    packet = queued[-1]
 
                 now = time.perf_counter()
+                capture.record_unprocessed(earlier, now - session_start)
                 parsed, parse_error = parse_packet_with_error(packet)
                 if parsed is None:
+                    capture.invalid_skipped += 1
                     print(
                         f"[WARNING] Paket diabaikan: {parse_error}"
                     )
                     continue
 
-                frame_number += 1
-                glove_tick, glove_seq = parse_packet_header(packet)
-                frame = frame_from_parsed(
-                    parsed,
-                    frame_number,
-                    now - session_start,
-                    glove_seq=glove_seq,
-                    glove_tick=glove_tick,
-                )
-                if recorder is not None:
-                    recorder.write_frame(frame)
+                frame = capture.new_frame(parsed, packet, now - session_start)
                 sensor_quaternions = frame_quaternions(frame, quaternion_order)
 
                 if calibration.phase == "open":
@@ -273,9 +340,9 @@ def run(
                         "Sekarang genggam tangan dengan nyaman, tahan posisi, "
                         "lalu tekan Enter untuk kalibrasi genggaman..."
                     )
-                    drain_udp_queue(sock)
+                    capture.record_unprocessed(drain_udp_packets(sock), frame.t)
                     last_status_time = 0.0
-                    calibration.start_grip(frame.n, frame.t)
+                    calibration.start_grip(capture.frame_number, frame.t)
                     continue
 
                 if calibration.phase == "grip":
@@ -297,9 +364,9 @@ def run(
                             "Atur ulang genggaman, tahan, lalu tekan Enter "
                             "untuk mencoba lagi..."
                         )
-                        drain_udp_queue(sock)
+                        capture.record_unprocessed(drain_udp_packets(sock), frame.t)
                         last_status_time = 0.0
-                        calibration.start_grip(frame.n, frame.t)
+                        calibration.start_grip(capture.frame_number, frame.t)
                         continue
 
                     for finger in calibration.skipped_fingers:
@@ -319,7 +386,7 @@ def run(
 
                 if now - last_status_time >= 0.5:
                     rate = calculate_packet_rate(packet_intervals)
-                    print(format_status(frame_number, rate, qpos, pipeline), end="\r")
+                    print(format_status(capture.frame_number, rate, qpos, pipeline), end="\r")
                     print()
                     last_status_time = now
 
@@ -328,7 +395,19 @@ def run(
         print("\n[STOP] Smartglove MuJoCo dihentikan.")
     finally:
         if recorder is not None:
-            recorder.close()
+            try:
+                if capture is not None and session_start is not None:
+                    recorder.write_event(
+                        "session_end",
+                        capture.frame_number,
+                        time.perf_counter() - session_start,
+                        capture="all" if record_all else "processed",
+                        frames=capture.frame_number,
+                        processed=capture.processed,
+                        invalid_skipped=capture.invalid_skipped,
+                    )
+            finally:
+                recorder.close()
         sock.close()
         env.close()
 
@@ -398,6 +477,7 @@ def replay(
     calib_from: str | Path | None = None,
     show_viewer: bool = True,
     realtime: bool = True,
+    frames: str = "processed",
 ) -> ReplayResult:
     """Putar ulang rekaman JSONL lewat pipeline yang sama dengan sesi live.
 
@@ -405,9 +485,18 @@ def replay(
     (hasilnya dibandingkan dengan nilai tersimpan; selisih jadi peringatan).
     mode="stored": memakai rata-rata quaternion yang tersimpan di event.
     ``calib_from`` meminjam kalibrasi dari rekaman lain (otomatis mode stored).
+
+    frames="processed": hanya frame yang diproses saat live, berbasis waktu
+    penerima ``t``; identik dengan sesi live.
+    frames="all": setiap frame (termasuk yang dibuang saat live) dipetakan
+    dengan waktu jam glove (``glove_tick``). Kalibrasi tetap memakai hanya
+    frame yang diproses, sama seperti live, dan duplikat ``glove_seq``
+    berurutan dilewati.
     """
     if mode not in ("recompute", "stored"):
         raise ValueError(f"mode replay tidak dikenal: {mode!r}")
+    if frames not in ("processed", "all"):
+        raise ValueError(f"frames replay tidak dikenal: {frames!r}")
     recording = read_recording(path)
     meta = recording.meta
     params = meta.get("params") or {}
@@ -423,6 +512,15 @@ def replay(
     warnings: list[str] = []
     if recording.truncated:
         warnings.append("baris terakhir rekaman terpotong dan dibuang")
+    if frames == "all" and recording.capture != "all":
+        warnings.append(
+            "rekaman hanya berisi frame yang diproses saat live (capture=processed); "
+            "mode 'all' tidak menambah data"
+        )
+    if meta.get("capture") is not None and not recording.ended_cleanly:
+        warnings.append(
+            "rekaman tidak ditutup dengan event session_end (sesi berhenti tidak normal?)"
+        )
     recorded_axes = (meta.get("wrist_axes") or {}).get("sha256")
     current_axes = (describe_axes_file(DEFAULT_AXES_FILE) or {}).get("sha256")
     if recorded_axes and current_axes and recorded_axes != current_axes:
@@ -457,8 +555,18 @@ def replay(
         if use_stored:
             session.apply_stored(stored_open, stored_grip)  # type: ignore[arg-type]
 
+        items = recording.items
+        if frames == "all":
+            glove_times = iter(glove_time_seconds(recording.frames))
+            items = [
+                replace(item, t=next(glove_times)) if isinstance(item, Frame) else item
+                for item in items
+            ]
+
         qpos_log: list[np.ndarray] = []
         frames_total = 0
+        last_seq: int | None = None
+        filter_primed = not use_stored
         viewer_context = (
             mujoco.viewer.launch_passive(pipeline.model, pipeline.data)
             if show_viewer
@@ -466,7 +574,7 @@ def replay(
         )
         previous_t: float | None = None
         with viewer_context as viewer:
-            for item in recording.items:
+            for item in items:
                 if viewer is not None and not viewer.is_running():
                     break
                 if isinstance(item, Event):
@@ -483,14 +591,36 @@ def replay(
                     continue
 
                 frames_total += 1
+                is_duplicate = (
+                    frames == "all"
+                    and item.glove_seq is not None
+                    and item.glove_seq == last_seq
+                )
+                last_seq = item.glove_seq
                 if use_stored and item.n < resume_n:
                     continue
-                quats = frame_quaternions(item, order)
+                if frames == "processed" and not item.processed:
+                    continue
                 if session.phase in ("open", "grip"):
+                    # Kalibrasi memakai hanya frame yang diproses saat live,
+                    # sehingga rata-ratanya sama dengan sesi aslinya.
+                    if not item.processed:
+                        continue
+                    quats = frame_quaternions(item, order)
                     if session.feed(item, quats) != "grip_done":
                         continue
-                elif not session.ready:
+                elif not session.ready or is_duplicate:
                     continue
+                else:
+                    quats = frame_quaternions(item, order)
+
+                if not filter_primed:
+                    # Mode stored: jalur live dan recompute melakukan reset(frame
+                    # penutup) lalu update pada waktu yang sama. Meniru urutan
+                    # operasi itu persis; inisialisasi malas oleh update() tidak
+                    # setara bit-per-bit (normalisasi ulang tidak selalu idempoten).
+                    pipeline.quaternion_filter.reset(quats, item.t)
+                    filter_primed = True
 
                 qpos_log.append(map_frame(pipeline, quats, item.t))
                 if viewer is not None:

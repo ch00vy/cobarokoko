@@ -4,8 +4,11 @@ Satu file rekaman berisi baris-baris JSON dengan tiga jenis ``type``:
 
 * ``meta``  - baris pertama; parameter sesi (urutan quaternion, parameter
   mapping, isi wrist_axes.json, commit kode).
-* ``frame`` - satu paket UDP valid yang benar-benar diproses mapper.
-* ``event`` - penanda tahap kerja (kalibrasi terbuka/genggam, catatan).
+* ``frame`` - satu paket UDP valid. Pada ``capture: "processed"`` hanya paket
+  yang diproses mapper; pada ``capture: "all"`` semua paket valid yang diterima,
+  dan paket yang tidak diproses saat live ditandai ``"proc": false``.
+* ``event`` - penanda tahap kerja (kalibrasi terbuka/genggam, catatan,
+  ``session_end`` bila sesi berakhir normal).
 
 Prinsip desain:
 
@@ -17,6 +20,12 @@ Prinsip desain:
   yang dipakai sesi (flag ``--quaternion-order``).
 * ``p`` (posisi mentah) satuannya belum diketahui dan tidak dipakai mapper.
   Disimpan 9 digit signifikan.
+* Versi 1.1 menambah ``proc`` (frame) dan ``capture`` (meta). Keduanya opsional:
+  ``proc`` yang tidak ada berarti ``true``, ``capture`` yang tidak ada berarti
+  ``"processed"``, sehingga rekaman 1.0 tetap terbaca.
+* ``t`` adalah waktu penerima. Pada mode ``all`` beberapa frame dalam satu
+  gelombang baca memiliki ``t`` yang sama; urutan dan jarak waktu sebenarnya
+  ada di ``glove_seq`` dan ``glove_tick`` (milidetik, jam glove).
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ from typing import Any
 
 from smartglove_realtime import SENSOR_INDEX
 
-SCHEMA = "smartglove.frame/1"
+SCHEMA = "smartglove.frame/1.1"
 SCHEMA_PREFIX = "smartglove.frame/"
 SCHEMA_MAJOR = 1
 
@@ -37,6 +46,7 @@ SENSOR_SLOTS: dict[str, int] = dict(SENSOR_INDEX)
 SENSOR_NAMES: tuple[str, ...] = tuple(SENSOR_SLOTS)
 
 QUAT_ORDERS = ("xyzw", "wxyz")
+CAPTURE_MODES = ("processed", "all")
 QUAT_NORM_TOLERANCE = 1e-3
 TIME_DECIMALS = 6  # mikrodetik
 
@@ -64,6 +74,7 @@ class Frame:
     sensors: dict[str, SensorSample]
     glove_seq: int | None = None
     glove_tick: int | None = None
+    processed: bool = True
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,7 @@ def frame_from_parsed(
     t: float,
     glove_seq: int | None = None,
     glove_tick: int | None = None,
+    processed: bool = True,
 ) -> Frame:
     """Bentuk ``Frame`` dari keluaran ``parse_packet_with_error``.
 
@@ -110,6 +122,7 @@ def frame_from_parsed(
         sensors=sensors,
         glove_seq=glove_seq,
         glove_tick=glove_tick,
+        processed=processed,
     )
 
 
@@ -129,7 +142,7 @@ def frame_to_parsed(frame: Frame) -> dict[str, dict[str, Any]]:
 
 
 def frame_to_record(frame: Frame) -> dict[str, Any]:
-    return {
+    record = {
         "type": "frame",
         "n": frame.n,
         "t": frame.t,
@@ -144,6 +157,9 @@ def frame_to_record(frame: Frame) -> dict[str, Any]:
             for name, sample in frame.sensors.items()
         },
     }
+    if not frame.processed:  # dihilangkan bila true agar file tetap ringkas
+        record["proc"] = False
+    return record
 
 
 def event_to_record(event: Event) -> dict[str, Any]:
@@ -187,6 +203,12 @@ def check_meta(meta: dict[str, Any], line_number: int | None = None) -> None:
     _require(
         meta.get("quat_order") in QUAT_ORDERS,
         f"quat_order harus salah satu dari {QUAT_ORDERS}",
+        line_number,
+    )
+    capture = meta.get("capture", "processed")
+    _require(
+        capture in CAPTURE_MODES,
+        f"capture harus salah satu dari {CAPTURE_MODES}",
         line_number,
     )
     slots = meta.get("sensor_slots")
@@ -256,12 +278,16 @@ def record_to_frame(record: dict[str, Any], line_number: int | None = None) -> F
         )
         return value
 
+    processed = record.get("proc", True)
+    _require(isinstance(processed, bool), "'proc' harus boolean", line_number)
+
     return Frame(
         n=n,  # type: ignore[arg-type]
         t=float(t),  # type: ignore[arg-type]
         sensors=sensors,
         glove_seq=optional_int("glove_seq"),
         glove_tick=optional_int("glove_tick"),
+        processed=processed,
     )
 
 
@@ -292,3 +318,31 @@ def count_glove_seq_gaps(frames: list[Frame]) -> int:
             gaps += frame.glove_seq - previous - 1
         previous = frame.glove_seq
     return gaps
+
+
+def glove_time_seconds(frames: list[Frame]) -> list[float]:
+    """Waktu tiap frame dari jam glove (``glove_tick``, milidetik), dimulai dari 0.
+
+    Dipakai replay mode ``all`` sebagai basis waktu yang seragam, karena ``t``
+    penerima sama untuk semua paket dalam satu gelombang baca. Satuan
+    milidetik terverifikasi pada rekaman nyata: jeda 18,49 detik di jam
+    komputer sama dengan 1541 paket x 12 ms.
+    """
+    if not frames:
+        return []
+    first = frames[0].glove_tick
+    previous: int | None = None
+    result: list[float] = []
+    for frame in frames:
+        if frame.glove_tick is None or first is None:
+            raise RecordingError(
+                f"frame {frame.n} tidak punya glove_tick; mode 'all' membutuhkannya"
+            )
+        if previous is not None and frame.glove_tick < previous:
+            raise RecordingError(
+                f"glove_tick turun di frame {frame.n} ({previous} -> {frame.glove_tick}); "
+                "glove kemungkinan dimulai ulang di tengah rekaman"
+            )
+        previous = frame.glove_tick
+        result.append((frame.glove_tick - first) / 1000.0)
+    return result

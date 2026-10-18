@@ -8,11 +8,13 @@ from smartglove.frame import (
     SENSOR_NAMES,
     Event,
     RecordingError,
+    check_meta,
     count_glove_seq_gaps,
     dumps,
     frame_from_parsed,
     frame_to_parsed,
     frame_to_record,
+    glove_time_seconds,
     record_to_frame,
 )
 from smartglove.recorder import JsonlRecorder, build_meta, read_recording
@@ -91,6 +93,49 @@ class FrameTests(unittest.TestCase):
         with self.assertRaisesRegex(RecordingError, "norma"):
             record_to_frame(record)
 
+    def test_unprocessed_flag_round_trips_and_is_omitted_when_true(self) -> None:
+        processed = frame_from_parsed(synthetic_parsed(), n=1, t=0.0)
+        skipped = frame_from_parsed(synthetic_parsed(), n=2, t=0.0, processed=False)
+        self.assertNotIn("proc", frame_to_record(processed))
+        self.assertIs(frame_to_record(skipped)["proc"], False)
+        self.assertEqual(record_to_frame(json.loads(dumps(frame_to_record(skipped)))), skipped)
+        self.assertTrue(record_to_frame(json.loads(dumps(frame_to_record(processed)))).processed)
+
+    def test_missing_proc_means_processed_for_older_recordings(self) -> None:
+        record = frame_to_record(frame_from_parsed(synthetic_parsed(), n=1, t=0.0))
+        record.pop("proc", None)
+        self.assertTrue(record_to_frame(record).processed)
+
+    def test_non_boolean_proc_is_rejected(self) -> None:
+        record = frame_to_record(frame_from_parsed(synthetic_parsed(), n=1, t=0.0))
+        record["proc"] = "no"
+        with self.assertRaisesRegex(RecordingError, "proc"):
+            record_to_frame(record)
+
+    def test_meta_capture_must_be_known_and_defaults_to_processed(self) -> None:
+        meta = make_meta()
+        meta.pop("capture")
+        check_meta(meta)  # rekaman 1.0 tanpa capture tetap sah
+        meta["capture"] = "everything"
+        with self.assertRaisesRegex(RecordingError, "capture"):
+            check_meta(meta)
+
+    def test_glove_time_uses_ticks_in_milliseconds_from_zero(self) -> None:
+        frames = [
+            frame_from_parsed(synthetic_parsed(), n=i + 1, t=0.0, glove_tick=tick)
+            for i, tick in enumerate((5000, 5012, 5012, 5060))
+        ]
+        self.assertEqual(glove_time_seconds(frames), [0.0, 0.012, 0.012, 0.06])
+
+    def test_glove_time_rejects_missing_or_decreasing_ticks(self) -> None:
+        good = frame_from_parsed(synthetic_parsed(), n=1, t=0.0, glove_tick=100)
+        no_tick = frame_from_parsed(synthetic_parsed(), n=2, t=0.0)
+        back = frame_from_parsed(synthetic_parsed(), n=3, t=0.0, glove_tick=50)
+        with self.assertRaisesRegex(RecordingError, "glove_tick"):
+            glove_time_seconds([good, no_tick])
+        with self.assertRaisesRegex(RecordingError, "turun"):
+            glove_time_seconds([good, back])
+
     def test_glove_seq_gap_counting(self) -> None:
         frames = [
             frame_from_parsed(synthetic_parsed(), n=i + 1, t=i * 0.01, glove_seq=seq)
@@ -162,7 +207,8 @@ class RecorderTests(unittest.TestCase):
 
     def test_meta_carries_required_fields(self) -> None:
         meta = make_meta()
-        self.assertEqual(meta["schema"], "smartglove.frame/1")
+        self.assertEqual(meta["schema"], "smartglove.frame/1.1")
+        self.assertEqual(meta["capture"], "processed")
         self.assertEqual(meta["quat_order"], "xyzw")
         self.assertEqual(meta["packet_bytes"], 624)
         self.assertIn("THUMB", meta["sensor_slots"])
@@ -248,6 +294,14 @@ class RecorderTests(unittest.TestCase):
         self.path.write_text("\n".join(lines))
         with self.assertRaisesRegex(RecordingError, "meta"):
             read_recording(self.path)
+
+    def test_ended_cleanly_requires_session_end_event(self) -> None:
+        self.write_sample()
+        self.assertFalse(read_recording(self.path).ended_cleanly)
+        with JsonlRecorder(self.path, make_meta()) as recorder:
+            recorder.write_frame(frame_from_parsed(synthetic_parsed(), 1, 0.0))
+            recorder.write_event("session_end", 1, 0.0, frames=1)
+        self.assertTrue(read_recording(self.path).ended_cleanly)
 
     def test_empty_file_is_rejected(self) -> None:
         self.path.parent.mkdir(parents=True)

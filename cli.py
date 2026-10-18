@@ -39,6 +39,14 @@ def main() -> None:
         help="Rekam sesi live ke JSONL (frame yang diproses + event kalibrasi).",
     )
     parser.add_argument(
+        "--record-all",
+        action="store_true",
+        help=(
+            "Dengan --record: rekam SEMUA paket valid (sekitar 83 Hz), termasuk "
+            "yang dibuang saat live. Sekitar 6 MB per menit."
+        ),
+    )
+    parser.add_argument(
         "--replay",
         metavar="PATH.jsonl",
         help="Putar ulang rekaman JSONL tanpa glove memakai pipeline yang sama.",
@@ -50,6 +58,15 @@ def main() -> None:
         help=(
             "recompute: hitung ulang kalibrasi dari frame di rekaman (default); "
             "stored: pakai nilai kalibrasi yang tersimpan di event."
+        ),
+    )
+    parser.add_argument(
+        "--replay-frames",
+        choices=("processed", "all"),
+        default="processed",
+        help=(
+            "processed: hanya frame yang diproses saat live (default, identik "
+            "dengan sesi live); all: semua frame dengan waktu jam glove."
         ),
     )
     parser.add_argument(
@@ -84,6 +101,7 @@ def main() -> None:
             for flag, used in (
                 ("--calib-from", args.calib_from is not None),
                 ("--replay-calib", args.replay_calib != "recompute"),
+                ("--replay-frames", args.replay_frames != "processed"),
                 ("--no-viewer", args.no_viewer),
                 ("--no-realtime", args.no_realtime),
             )
@@ -91,16 +109,19 @@ def main() -> None:
         ]
         if replay_only:
             parser.error(f"{', '.join(replay_only)} hanya berlaku bersama --replay.")
+        if args.record_all and args.record is None:
+            parser.error("--record-all membutuhkan --record PATH.jsonl.")
         run(
             args.quaternion_order or "xyzw",
             1.0 if args.flexion_gain is None else args.flexion_gain,
             FILTER_CUTOFF_HZ if args.filter_cutoff_hz is None else args.filter_cutoff_hz,
             record_path=args.record,
+            record_all=args.record_all,
         )
         return
 
-    if args.record is not None:
-        parser.error("--record hanya untuk sesi live, tidak bisa bersama --replay.")
+    if args.record is not None or args.record_all:
+        parser.error("--record dan --record-all hanya untuk sesi live, tidak bisa bersama --replay.")
     result = replay(
         args.replay,
         quaternion_order=args.quaternion_order,
@@ -110,6 +131,7 @@ def main() -> None:
         calib_from=args.calib_from,
         show_viewer=not args.no_viewer,
         realtime=not args.no_realtime,
+        frames=args.replay_frames,
     )
     print(
         f"[OK] Replay selesai: {result.frames_mapped} frame dipetakan "

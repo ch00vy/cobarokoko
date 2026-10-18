@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import builtins
 import socket as real_socket
+import struct
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -54,14 +55,56 @@ def session_packets() -> list[bytes]:
     )
 
 
-class FakeSocket:
-    """Meniru soket UDP dengan antrean paket; drain_udp_queue melihat antrean kosong."""
+def renumber_packets(
+    packets: list[bytes], start_seq: int = 1000, start_tick: int = 50_000, step_ms: int = 12
+) -> list[bytes]:
+    """Tulis ulang seq (0x24) dan tick (0x20) di header agar aliran sintetis dari
+    beberapa capture menjadi satu aliran kontinu seperti glove sungguhan."""
+    out = []
+    for index, packet in enumerate(packets):
+        buffer = bytearray(packet)
+        struct.pack_into("<II", buffer, 0x20, start_tick + index * step_ms, start_seq + index)
+        out.append(bytes(buffer))
+    return out
 
-    def __init__(self, packets: list[bytes], state: SimpleNamespace) -> None:
+
+def batch_sizes_for(total: int, pattern: tuple[int, ...] = (4, 3, 2, 3, 1)) -> list[int]:
+    """Ukuran gelombang baca (paket per iterasi loop) yang jumlahnya tepat ``total``."""
+    sizes: list[int] = []
+    cursor = 0
+    while sum(sizes) < total:
+        sizes.append(pattern[cursor % len(pattern)])
+        cursor += 1
+    sizes[-1] -= sum(sizes) - total
+    return sizes
+
+
+class FakeSocket:
+    """Meniru soket UDP.
+
+    ``batch_sizes`` menentukan berapa paket yang sudah mengantre tiap kali loop
+    membaca: satu dikembalikan recvfrom biasa, sisanya oleh drain (non-blocking).
+    Default: satu paket per iterasi, sehingga drain selalu melihat antrean kosong.
+    """
+
+    def __init__(
+        self,
+        packets: list[bytes],
+        state: SimpleNamespace,
+        batch_sizes: list[int] | None = None,
+    ) -> None:
         self._packets = list(packets)
         self._index = 0
         self._state = state
         self._nonblocking = False
+        self._pending: list[bytes] = []
+        self._batch_sizes = list(batch_sizes) if batch_sizes is not None else None
+        self._batch_index = 0
+        state.sockets.append(self)
+
+    def inject(self, packets: list[bytes]) -> None:
+        """Paket yang menumpuk di buffer OS, misalnya saat menunggu Enter."""
+        self._pending.extend(packets)
 
     def setsockopt(self, *args: object) -> None: ...
     def bind(self, *args: object) -> None: ...
@@ -75,13 +118,21 @@ class FakeSocket:
 
     def recvfrom(self, size: int):
         if self._nonblocking:
+            if self._pending:
+                return self._pending.pop(0), ("127.0.0.1", 14041)
             raise BlockingIOError
-        if self._index >= len(self._packets):
-            self._state.exhausted = True
-            raise real_socket.timeout
-        packet = self._packets[self._index]
-        self._index += 1
-        return packet, ("127.0.0.1", 14041)
+        if not self._pending:
+            if self._index >= len(self._packets):
+                self._state.exhausted = True
+                raise real_socket.timeout
+            if self._batch_sizes is None:
+                count = 1
+            else:
+                count = self._batch_sizes[self._batch_index]
+                self._batch_index += 1
+            self._pending = self._packets[self._index : self._index + count]
+            self._index += len(self._pending)
+        return self._pending.pop(0), ("127.0.0.1", 14041)
 
 
 class FakeViewer:
@@ -115,12 +166,26 @@ def run_fake_live_session(
     quaternion_order: str = "xyzw",
     flexion_gain: float = 1.0,
     filter_cutoff_hz: float = 12.0,
+    batch_sizes: list[int] | None = None,
+    stale_packets: list[bytes] | None = None,
     **run_kwargs,
 ) -> np.ndarray:
-    """Jalankan ``smartglove.runtime.run`` dan kembalikan qpos (frame x nq)."""
+    """Jalankan ``smartglove.runtime.run`` dan kembalikan qpos (frame x nq).
+
+    ``stale_packets`` disuntik ke buffer soket saat prompt Enter kedua (sebelum
+    kalibrasi genggam), seperti paket yang menumpuk selama pengguna menunggu.
+    """
     from smartglove import runtime
 
-    state = SimpleNamespace(exhausted=False)
+    state = SimpleNamespace(exhausted=False, sockets=[])
+    prompts = {"count": 0}
+
+    def fake_input(*args: object) -> str:
+        prompts["count"] += 1
+        if prompts["count"] == 2 and stale_packets:
+            state.sockets[0].inject(list(stale_packets))
+        return ""
+
     packets = session_packets() if packets is None else packets
     clock = {"t": 1000.0}
 
@@ -129,7 +194,7 @@ def run_fake_live_session(
         return clock["t"]
 
     fake_socket_module = SimpleNamespace(
-        socket=lambda *a, **k: FakeSocket(packets, state),
+        socket=lambda *a, **k: FakeSocket(packets, state, batch_sizes),
         AF_INET=real_socket.AF_INET,
         SOCK_DGRAM=real_socket.SOCK_DGRAM,
         SOL_SOCKET=real_socket.SOL_SOCKET,
@@ -145,7 +210,7 @@ def run_fake_live_session(
         mock.patch.object(runtime, "time", fake_time),
         mock.patch.object(runtime.mujoco, "viewer", fake_viewer_module),
         mock.patch.object(runtime, "SmartGloveMuscleController", RecordingController),
-        mock.patch.object(builtins, "input", lambda *a: ""),
+        mock.patch.object(builtins, "input", fake_input),
     ):
         runtime.run(quaternion_order, flexion_gain, filter_cutoff_hz, **run_kwargs)
     return np.array(RecordingController.qpos_log)

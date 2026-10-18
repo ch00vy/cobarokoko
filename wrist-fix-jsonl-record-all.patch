@@ -1,0 +1,1089 @@
+diff --git a/cli.py b/cli.py
+index eec135a..15998eb 100644
+--- a/cli.py
++++ b/cli.py
+@@ -38,6 +38,14 @@ def main() -> None:
+         metavar="PATH.jsonl",
+         help="Rekam sesi live ke JSONL (frame yang diproses + event kalibrasi).",
+     )
++    parser.add_argument(
++        "--record-all",
++        action="store_true",
++        help=(
++            "Dengan --record: rekam SEMUA paket valid (sekitar 83 Hz), termasuk "
++            "yang dibuang saat live. Sekitar 6 MB per menit."
++        ),
++    )
+     parser.add_argument(
+         "--replay",
+         metavar="PATH.jsonl",
+@@ -52,6 +60,15 @@ def main() -> None:
+             "stored: pakai nilai kalibrasi yang tersimpan di event."
+         ),
+     )
++    parser.add_argument(
++        "--replay-frames",
++        choices=("processed", "all"),
++        default="processed",
++        help=(
++            "processed: hanya frame yang diproses saat live (default, identik "
++            "dengan sesi live); all: semua frame dengan waktu jam glove."
++        ),
++    )
+     parser.add_argument(
+         "--calib-from",
+         metavar="PATH.jsonl",
+@@ -84,6 +101,7 @@ def main() -> None:
+             for flag, used in (
+                 ("--calib-from", args.calib_from is not None),
+                 ("--replay-calib", args.replay_calib != "recompute"),
++                ("--replay-frames", args.replay_frames != "processed"),
+                 ("--no-viewer", args.no_viewer),
+                 ("--no-realtime", args.no_realtime),
+             )
+@@ -91,16 +109,19 @@ def main() -> None:
+         ]
+         if replay_only:
+             parser.error(f"{', '.join(replay_only)} hanya berlaku bersama --replay.")
++        if args.record_all and args.record is None:
++            parser.error("--record-all membutuhkan --record PATH.jsonl.")
+         run(
+             args.quaternion_order or "xyzw",
+             1.0 if args.flexion_gain is None else args.flexion_gain,
+             FILTER_CUTOFF_HZ if args.filter_cutoff_hz is None else args.filter_cutoff_hz,
+             record_path=args.record,
++            record_all=args.record_all,
+         )
+         return
+ 
+-    if args.record is not None:
+-        parser.error("--record hanya untuk sesi live, tidak bisa bersama --replay.")
++    if args.record is not None or args.record_all:
++        parser.error("--record dan --record-all hanya untuk sesi live, tidak bisa bersama --replay.")
+     result = replay(
+         args.replay,
+         quaternion_order=args.quaternion_order,
+@@ -110,6 +131,7 @@ def main() -> None:
+         calib_from=args.calib_from,
+         show_viewer=not args.no_viewer,
+         realtime=not args.no_realtime,
++        frames=args.replay_frames,
+     )
+     print(
+         f"[OK] Replay selesai: {result.frames_mapped} frame dipetakan "
+diff --git a/smartglove/frame.py b/smartglove/frame.py
+index 655770c..6cca6bf 100644
+--- a/smartglove/frame.py
++++ b/smartglove/frame.py
+@@ -4,8 +4,11 @@ Satu file rekaman berisi baris-baris JSON dengan tiga jenis ``type``:
+ 
+ * ``meta``  - baris pertama; parameter sesi (urutan quaternion, parameter
+   mapping, isi wrist_axes.json, commit kode).
+-* ``frame`` - satu paket UDP valid yang benar-benar diproses mapper.
+-* ``event`` - penanda tahap kerja (kalibrasi terbuka/genggam, catatan).
++* ``frame`` - satu paket UDP valid. Pada ``capture: "processed"`` hanya paket
++  yang diproses mapper; pada ``capture: "all"`` semua paket valid yang diterima,
++  dan paket yang tidak diproses saat live ditandai ``"proc": false``.
++* ``event`` - penanda tahap kerja (kalibrasi terbuka/genggam, catatan,
++  ``session_end`` bila sesi berakhir normal).
+ 
+ Prinsip desain:
+ 
+@@ -17,6 +20,12 @@ Prinsip desain:
+   yang dipakai sesi (flag ``--quaternion-order``).
+ * ``p`` (posisi mentah) satuannya belum diketahui dan tidak dipakai mapper.
+   Disimpan 9 digit signifikan.
++* Versi 1.1 menambah ``proc`` (frame) dan ``capture`` (meta). Keduanya opsional:
++  ``proc`` yang tidak ada berarti ``true``, ``capture`` yang tidak ada berarti
++  ``"processed"``, sehingga rekaman 1.0 tetap terbaca.
++* ``t`` adalah waktu penerima. Pada mode ``all`` beberapa frame dalam satu
++  gelombang baca memiliki ``t`` yang sama; urutan dan jarak waktu sebenarnya
++  ada di ``glove_seq`` dan ``glove_tick`` (milidetik, jam glove).
+ """
+ 
+ from __future__ import annotations
+@@ -28,7 +37,7 @@ from typing import Any
+ 
+ from smartglove_realtime import SENSOR_INDEX
+ 
+-SCHEMA = "smartglove.frame/1"
++SCHEMA = "smartglove.frame/1.1"
+ SCHEMA_PREFIX = "smartglove.frame/"
+ SCHEMA_MAJOR = 1
+ 
+@@ -37,6 +46,7 @@ SENSOR_SLOTS: dict[str, int] = dict(SENSOR_INDEX)
+ SENSOR_NAMES: tuple[str, ...] = tuple(SENSOR_SLOTS)
+ 
+ QUAT_ORDERS = ("xyzw", "wxyz")
++CAPTURE_MODES = ("processed", "all")
+ QUAT_NORM_TOLERANCE = 1e-3
+ TIME_DECIMALS = 6  # mikrodetik
+ 
+@@ -64,6 +74,7 @@ class Frame:
+     sensors: dict[str, SensorSample]
+     glove_seq: int | None = None
+     glove_tick: int | None = None
++    processed: bool = True
+ 
+ 
+ @dataclass(frozen=True)
+@@ -87,6 +98,7 @@ def frame_from_parsed(
+     t: float,
+     glove_seq: int | None = None,
+     glove_tick: int | None = None,
++    processed: bool = True,
+ ) -> Frame:
+     """Bentuk ``Frame`` dari keluaran ``parse_packet_with_error``.
+ 
+@@ -110,6 +122,7 @@ def frame_from_parsed(
+         sensors=sensors,
+         glove_seq=glove_seq,
+         glove_tick=glove_tick,
++        processed=processed,
+     )
+ 
+ 
+@@ -129,7 +142,7 @@ def frame_to_parsed(frame: Frame) -> dict[str, dict[str, Any]]:
+ 
+ 
+ def frame_to_record(frame: Frame) -> dict[str, Any]:
+-    return {
++    record = {
+         "type": "frame",
+         "n": frame.n,
+         "t": frame.t,
+@@ -144,6 +157,9 @@ def frame_to_record(frame: Frame) -> dict[str, Any]:
+             for name, sample in frame.sensors.items()
+         },
+     }
++    if not frame.processed:  # dihilangkan bila true agar file tetap ringkas
++        record["proc"] = False
++    return record
+ 
+ 
+ def event_to_record(event: Event) -> dict[str, Any]:
+@@ -189,6 +205,12 @@ def check_meta(meta: dict[str, Any], line_number: int | None = None) -> None:
+         f"quat_order harus salah satu dari {QUAT_ORDERS}",
+         line_number,
+     )
++    capture = meta.get("capture", "processed")
++    _require(
++        capture in CAPTURE_MODES,
++        f"capture harus salah satu dari {CAPTURE_MODES}",
++        line_number,
++    )
+     slots = meta.get("sensor_slots")
+     _require(
+         slots == SENSOR_SLOTS,
+@@ -256,12 +278,16 @@ def record_to_frame(record: dict[str, Any], line_number: int | None = None) -> F
+         )
+         return value
+ 
++    processed = record.get("proc", True)
++    _require(isinstance(processed, bool), "'proc' harus boolean", line_number)
++
+     return Frame(
+         n=n,  # type: ignore[arg-type]
+         t=float(t),  # type: ignore[arg-type]
+         sensors=sensors,
+         glove_seq=optional_int("glove_seq"),
+         glove_tick=optional_int("glove_tick"),
++        processed=processed,
+     )
+ 
+ 
+@@ -292,3 +318,31 @@ def count_glove_seq_gaps(frames: list[Frame]) -> int:
+             gaps += frame.glove_seq - previous - 1
+         previous = frame.glove_seq
+     return gaps
++
++
++def glove_time_seconds(frames: list[Frame]) -> list[float]:
++    """Waktu tiap frame dari jam glove (``glove_tick``, milidetik), dimulai dari 0.
++
++    Dipakai replay mode ``all`` sebagai basis waktu yang seragam, karena ``t``
++    penerima sama untuk semua paket dalam satu gelombang baca. Satuan
++    milidetik terverifikasi pada rekaman nyata: jeda 18,49 detik di jam
++    komputer sama dengan 1541 paket x 12 ms.
++    """
++    if not frames:
++        return []
++    first = frames[0].glove_tick
++    previous: int | None = None
++    result: list[float] = []
++    for frame in frames:
++        if frame.glove_tick is None or first is None:
++            raise RecordingError(
++                f"frame {frame.n} tidak punya glove_tick; mode 'all' membutuhkannya"
++            )
++        if previous is not None and frame.glove_tick < previous:
++            raise RecordingError(
++                f"glove_tick turun di frame {frame.n} ({previous} -> {frame.glove_tick}); "
++                "glove kemungkinan dimulai ulang di tengah rekaman"
++            )
++        previous = frame.glove_tick
++        result.append((frame.glove_tick - first) / 1000.0)
++    return result
+diff --git a/smartglove/recorder.py b/smartglove/recorder.py
+index 4573d3e..58157cf 100644
+--- a/smartglove/recorder.py
++++ b/smartglove/recorder.py
+@@ -65,6 +65,7 @@ def build_meta(
+     hand: str | None = None,
+     device: str = "rokoko-smartglove-v1",
+     packet_bytes: int = DEFAULT_PACKET_BYTES,
++    capture: str = "processed",
+ ) -> dict[str, Any]:
+     meta = {
+         "type": "meta",
+@@ -75,6 +76,7 @@ def build_meta(
+         "packet_bytes": packet_bytes,
+         "quat_order": quat_order,
+         "quat_normalized": True,
++        "capture": capture,
+         "sensor_slots": dict(SENSOR_SLOTS),
+         "source": source,
+         "app_commit": _git_commit(),
+@@ -158,6 +160,16 @@ class Recording:
+     def events(self) -> list[Event]:
+         return [item for item in self.items if isinstance(item, Event)]
+ 
++    @property
++    def capture(self) -> str:
++        return self.meta.get("capture", "processed")
++
++    @property
++    def ended_cleanly(self) -> bool:
++        """True bila rekaman ditutup dengan event ``session_end`` (tidak crash)."""
++        events = self.events
++        return bool(events) and events[-1].name == "session_end"
++
+ 
+ def read_recording(path: str | Path, tolerate_truncated_tail: bool = True) -> Recording:
+     """Baca dan validasi seluruh file.
+diff --git a/smartglove/runtime.py b/smartglove/runtime.py
+index b8e66c8..ab60fd1 100644
+--- a/smartglove/runtime.py
++++ b/smartglove/runtime.py
+@@ -3,7 +3,7 @@ import importlib
+ import socket
+ import time
+ from collections import deque
+-from dataclasses import dataclass, field
++from dataclasses import dataclass, field, replace
+ from pathlib import Path
+ 
+ import gymnasium as gym
+@@ -21,7 +21,13 @@ from smartglove.config import (
+     FINGER_JOINTS,
+     IK_ITERATIONS,
+ )
+-from smartglove.frame import Event, RecordingError, frame_from_parsed
++from smartglove.frame import (
++    Event,
++    Frame,
++    RecordingError,
++    frame_from_parsed,
++    glove_time_seconds,
++)
+ from smartglove.mapping import HandQposMapper
+ from smartglove.quaternion import (
+     QuaternionLowPassFilter,
+@@ -65,6 +71,67 @@ def drain_udp_queue(sock: socket.socket) -> bytes | None:
+     return latest_packet
+ 
+ 
++def drain_udp_packets(sock: socket.socket) -> list[bytes]:
++    """Ambil SEMUA paket yang sedang mengantre, dari yang tertua ke terbaru."""
++    packets: list[bytes] = []
++    sock.setblocking(False)
++    try:
++        while True:
++            try:
++                packet, _ = sock.recvfrom(65535)
++            except BlockingIOError:
++                break
++            packets.append(packet)
++    finally:
++        sock.settimeout(0.01)
++    return packets
++
++
++class LiveCapture:
++    """Penomoran frame live dan penulisan rekaman.
++
++    mode "processed": hanya paket yang diproses mapper yang direkam.
++    mode "all": setiap paket valid yang dibaca direkam, termasuk paket yang
++    dibuang drain (ditandai ``proc: false``). Pemrosesan tidak berubah: tetap
++    paket terbaru dari tiap gelombang baca.
++    """
++
++    def __init__(self, recorder: JsonlRecorder | None, record_all: bool) -> None:
++        self.recorder = recorder
++        self.record_all = bool(record_all and recorder is not None)
++        self.frame_number = 0
++        self.processed = 0
++        self.invalid_skipped = 0
++
++    def record_unprocessed(self, packets: list[bytes], t: float) -> None:
++        if not self.record_all:
++            return
++        for packet in packets:
++            parsed, _ = parse_packet_with_error(packet)
++            if parsed is None:
++                self.invalid_skipped += 1
++                continue
++            self.frame_number += 1
++            glove_tick, glove_seq = parse_packet_header(packet)
++            self.recorder.write_frame(  # type: ignore[union-attr]
++                frame_from_parsed(
++                    parsed, self.frame_number, t,
++                    glove_seq=glove_seq, glove_tick=glove_tick, processed=False,
++                )
++            )
++
++    def new_frame(self, parsed: dict, packet: bytes, t: float) -> Frame:
++        self.frame_number += 1
++        self.processed += 1
++        glove_tick, glove_seq = parse_packet_header(packet)
++        frame = frame_from_parsed(
++            parsed, self.frame_number, t, glove_seq=glove_seq, glove_tick=glove_tick
++        )
++        if self.recorder is not None:
++            self.recorder.write_frame(frame)
++        return frame
++
++
+ def capture_sensor_quaternions(parsed: dict, order: str) -> dict[str, np.ndarray]:
+     return {
+         finger: sensor_quaternion_to_wxyz(values["quaternion"], order)
+@@ -168,10 +235,15 @@ def run(
+     flexion_gain: float,
+     filter_cutoff_hz: float,
+     record_path: str | Path | None = None,
++    record_all: bool = False,
+ ) -> None:
++    if record_all and record_path is None:
++        raise ValueError("record_all membutuhkan record_path.")
+     env = gym.make(ENV_NAME)
+     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+     recorder: JsonlRecorder | None = None
++    capture: LiveCapture | None = None
++    session_start: float | None = None
+     try:
+         if record_path is not None:
+             recorder = JsonlRecorder(
+@@ -181,8 +253,10 @@ def run(
+                     source=f"{HOST}:{PORT}",
+                     params=session_params(flexion_gain, filter_cutoff_hz),
+                     axes_file=DEFAULT_AXES_FILE,
++                    capture="all" if record_all else "processed",
+                 ),
+             )
++        capture = LiveCapture(recorder, record_all)
+         pipeline = build_pipeline(
+             env,
+             quaternion_order,
+@@ -198,7 +272,8 @@ def run(
+         print(f"[OK] Flexion gain  : {flexion_gain:.2f}x")
+         print(f"[OK] Filter cutoff : {filter_cutoff_hz:.1f} Hz")
+         if recorder is not None:
+-            print(f"[OK] Rekaman JSONL : {recorder.path}")
++            mode_text = "semua paket" if record_all else "frame yang diproses"
++            print(f"[OK] Rekaman JSONL : {recorder.path} ({mode_text})")
+         print(
+             "Atur glove ke pose netral yang ingin dianggap sebagai tangan terbuka: "
+             "jari lurus, ibu jari terbuka, pergelangan rileks."
+@@ -217,7 +292,6 @@ def run(
+ 
+         packet_intervals = deque(maxlen=RATE_WINDOW_INTERVALS)
+         last_packet_time = None
+-        frame_number = 0
+         last_status_time = 0.0
+         session_start = time.perf_counter()
+         calibration.start_open(0, 0.0)
+@@ -230,29 +304,22 @@ def run(
+                     viewer.sync()
+                     continue
+ 
+-                latest_packet = drain_udp_queue(sock)
+-                if latest_packet is not None:
+-                    packet = latest_packet
++                queued = drain_udp_packets(sock)
++                earlier = [packet, *queued[:-1]] if queued else []
++                if queued:
++                    packet = queued[-1]
+ 
+                 now = time.perf_counter()
++                capture.record_unprocessed(earlier, now - session_start)
+                 parsed, parse_error = parse_packet_with_error(packet)
+                 if parsed is None:
++                    capture.invalid_skipped += 1
+                     print(
+                         f"[WARNING] Paket diabaikan: {parse_error}"
+                     )
+                     continue
+ 
+-                frame_number += 1
+-                glove_tick, glove_seq = parse_packet_header(packet)
+-                frame = frame_from_parsed(
+-                    parsed,
+-                    frame_number,
+-                    now - session_start,
+-                    glove_seq=glove_seq,
+-                    glove_tick=glove_tick,
+-                )
+-                if recorder is not None:
+-                    recorder.write_frame(frame)
++                frame = capture.new_frame(parsed, packet, now - session_start)
+                 sensor_quaternions = frame_quaternions(frame, quaternion_order)
+ 
+                 if calibration.phase == "open":
+@@ -273,9 +340,9 @@ def run(
+                         "Sekarang genggam tangan dengan nyaman, tahan posisi, "
+                         "lalu tekan Enter untuk kalibrasi genggaman..."
+                     )
+-                    drain_udp_queue(sock)
++                    capture.record_unprocessed(drain_udp_packets(sock), frame.t)
+                     last_status_time = 0.0
+-                    calibration.start_grip(frame.n, frame.t)
++                    calibration.start_grip(capture.frame_number, frame.t)
+                     continue
+ 
+                 if calibration.phase == "grip":
+@@ -297,9 +364,9 @@ def run(
+                             "Atur ulang genggaman, tahan, lalu tekan Enter "
+                             "untuk mencoba lagi..."
+                         )
+-                        drain_udp_queue(sock)
++                        capture.record_unprocessed(drain_udp_packets(sock), frame.t)
+                         last_status_time = 0.0
+-                        calibration.start_grip(frame.n, frame.t)
++                        calibration.start_grip(capture.frame_number, frame.t)
+                         continue
+ 
+                     for finger in calibration.skipped_fingers:
+@@ -319,7 +386,7 @@ def run(
+ 
+                 if now - last_status_time >= 0.5:
+                     rate = calculate_packet_rate(packet_intervals)
+-                    print(format_status(frame_number, rate, qpos, pipeline), end="\r")
++                    print(format_status(capture.frame_number, rate, qpos, pipeline), end="\r")
+                     print()
+                     last_status_time = now
+ 
+@@ -328,7 +395,19 @@ def run(
+         print("\n[STOP] Smartglove MuJoCo dihentikan.")
+     finally:
+         if recorder is not None:
+-            recorder.close()
++            try:
++                if capture is not None and session_start is not None:
++                    recorder.write_event(
++                        "session_end",
++                        capture.frame_number,
++                        time.perf_counter() - session_start,
++                        capture="all" if record_all else "processed",
++                        frames=capture.frame_number,
++                        processed=capture.processed,
++                        invalid_skipped=capture.invalid_skipped,
++                    )
++            finally:
++                recorder.close()
+         sock.close()
+         env.close()
+ 
+@@ -398,6 +477,7 @@ def replay(
+     calib_from: str | Path | None = None,
+     show_viewer: bool = True,
+     realtime: bool = True,
++    frames: str = "processed",
+ ) -> ReplayResult:
+     """Putar ulang rekaman JSONL lewat pipeline yang sama dengan sesi live.
+ 
+@@ -405,9 +485,18 @@ def replay(
+     (hasilnya dibandingkan dengan nilai tersimpan; selisih jadi peringatan).
+     mode="stored": memakai rata-rata quaternion yang tersimpan di event.
+     ``calib_from`` meminjam kalibrasi dari rekaman lain (otomatis mode stored).
++
++    frames="processed": hanya frame yang diproses saat live, berbasis waktu
++    penerima ``t``; identik dengan sesi live.
++    frames="all": setiap frame (termasuk yang dibuang saat live) dipetakan
++    dengan waktu jam glove (``glove_tick``). Kalibrasi tetap memakai hanya
++    frame yang diproses, sama seperti live, dan duplikat ``glove_seq``
++    berurutan dilewati.
+     """
+     if mode not in ("recompute", "stored"):
+         raise ValueError(f"mode replay tidak dikenal: {mode!r}")
++    if frames not in ("processed", "all"):
++        raise ValueError(f"frames replay tidak dikenal: {frames!r}")
+     recording = read_recording(path)
+     meta = recording.meta
+     params = meta.get("params") or {}
+@@ -423,6 +512,15 @@ def replay(
+     warnings: list[str] = []
+     if recording.truncated:
+         warnings.append("baris terakhir rekaman terpotong dan dibuang")
++    if frames == "all" and recording.capture != "all":
++        warnings.append(
++            "rekaman hanya berisi frame yang diproses saat live (capture=processed); "
++            "mode 'all' tidak menambah data"
++        )
++    if meta.get("capture") is not None and not recording.ended_cleanly:
++        warnings.append(
++            "rekaman tidak ditutup dengan event session_end (sesi berhenti tidak normal?)"
++        )
+     recorded_axes = (meta.get("wrist_axes") or {}).get("sha256")
+     current_axes = (describe_axes_file(DEFAULT_AXES_FILE) or {}).get("sha256")
+     if recorded_axes and current_axes and recorded_axes != current_axes:
+@@ -457,8 +555,17 @@ def replay(
+         if use_stored:
+             session.apply_stored(stored_open, stored_grip)  # type: ignore[arg-type]
+ 
++        items = recording.items
++        if frames == "all":
++            glove_times = iter(glove_time_seconds(recording.frames))
++            items = [
++                replace(item, t=next(glove_times)) if isinstance(item, Frame) else item
++                for item in items
++            ]
++
+         qpos_log: list[np.ndarray] = []
+         frames_total = 0
++        last_seq: int | None = None
+         viewer_context = (
+             mujoco.viewer.launch_passive(pipeline.model, pipeline.data)
+             if show_viewer
+@@ -466,7 +573,7 @@ def replay(
+         )
+         previous_t: float | None = None
+         with viewer_context as viewer:
+-            for item in recording.items:
++            for item in items:
+                 if viewer is not None and not viewer.is_running():
+                     break
+                 if isinstance(item, Event):
+@@ -483,14 +590,28 @@ def replay(
+                     continue
+ 
+                 frames_total += 1
++                is_duplicate = (
++                    frames == "all"
++                    and item.glove_seq is not None
++                    and item.glove_seq == last_seq
++                )
++                last_seq = item.glove_seq
+                 if use_stored and item.n < resume_n:
+                     continue
+-                quats = frame_quaternions(item, order)
++                if frames == "processed" and not item.processed:
++                    continue
+                 if session.phase in ("open", "grip"):
++                    # Kalibrasi memakai hanya frame yang diproses saat live,
++                    # sehingga rata-ratanya sama dengan sesi aslinya.
++                    if not item.processed:
++                        continue
++                    quats = frame_quaternions(item, order)
+                     if session.feed(item, quats) != "grip_done":
+                         continue
+-                elif not session.ready:
++                elif not session.ready or is_duplicate:
+                     continue
++                else:
++                    quats = frame_quaternions(item, order)
+ 
+                 qpos_log.append(map_frame(pipeline, quats, item.t))
+                 if viewer is not None:
+diff --git a/test/runtime_fakes.py b/test/runtime_fakes.py
+index c32204c..9d5f25f 100644
+--- a/test/runtime_fakes.py
++++ b/test/runtime_fakes.py
+@@ -14,6 +14,7 @@ from __future__ import annotations
+ 
+ import builtins
+ import socket as real_socket
++import struct
+ from pathlib import Path
+ from types import SimpleNamespace
+ from unittest import mock
+@@ -54,14 +55,56 @@ def session_packets() -> list[bytes]:
+     )
+ 
+ 
+-class FakeSocket:
+-    """Meniru soket UDP dengan antrean paket; drain_udp_queue melihat antrean kosong."""
++def renumber_packets(
++    packets: list[bytes], start_seq: int = 1000, start_tick: int = 50_000, step_ms: int = 12
++) -> list[bytes]:
++    """Tulis ulang seq (0x24) dan tick (0x20) di header agar aliran sintetis dari
++    beberapa capture menjadi satu aliran kontinu seperti glove sungguhan."""
++    out = []
++    for index, packet in enumerate(packets):
++        buffer = bytearray(packet)
++        struct.pack_into("<II", buffer, 0x20, start_tick + index * step_ms, start_seq + index)
++        out.append(bytes(buffer))
++    return out
++
++
++def batch_sizes_for(total: int, pattern: tuple[int, ...] = (4, 3, 2, 3, 1)) -> list[int]:
++    """Ukuran gelombang baca (paket per iterasi loop) yang jumlahnya tepat ``total``."""
++    sizes: list[int] = []
++    cursor = 0
++    while sum(sizes) < total:
++        sizes.append(pattern[cursor % len(pattern)])
++        cursor += 1
++    sizes[-1] -= sum(sizes) - total
++    return sizes
+ 
+-    def __init__(self, packets: list[bytes], state: SimpleNamespace) -> None:
++
++class FakeSocket:
++    """Meniru soket UDP.
++
++    ``batch_sizes`` menentukan berapa paket yang sudah mengantre tiap kali loop
++    membaca: satu dikembalikan recvfrom biasa, sisanya oleh drain (non-blocking).
++    Default: satu paket per iterasi, sehingga drain selalu melihat antrean kosong.
++    """
++
++    def __init__(
++        self,
++        packets: list[bytes],
++        state: SimpleNamespace,
++        batch_sizes: list[int] | None = None,
++    ) -> None:
+         self._packets = list(packets)
+         self._index = 0
+         self._state = state
+         self._nonblocking = False
++        self._pending: list[bytes] = []
++        self._batch_sizes = list(batch_sizes) if batch_sizes is not None else None
++        self._batch_index = 0
++        state.sockets.append(self)
++
++    def inject(self, packets: list[bytes]) -> None:
++        """Paket yang menumpuk di buffer OS, misalnya saat menunggu Enter."""
++        self._pending.extend(packets)
+ 
+     def setsockopt(self, *args: object) -> None: ...
+     def bind(self, *args: object) -> None: ...
+@@ -75,13 +118,21 @@ class FakeSocket:
+ 
+     def recvfrom(self, size: int):
+         if self._nonblocking:
++            if self._pending:
++                return self._pending.pop(0), ("127.0.0.1", 14041)
+             raise BlockingIOError
+-        if self._index >= len(self._packets):
+-            self._state.exhausted = True
+-            raise real_socket.timeout
+-        packet = self._packets[self._index]
+-        self._index += 1
+-        return packet, ("127.0.0.1", 14041)
++        if not self._pending:
++            if self._index >= len(self._packets):
++                self._state.exhausted = True
++                raise real_socket.timeout
++            if self._batch_sizes is None:
++                count = 1
++            else:
++                count = self._batch_sizes[self._batch_index]
++                self._batch_index += 1
++            self._pending = self._packets[self._index : self._index + count]
++            self._index += len(self._pending)
++        return self._pending.pop(0), ("127.0.0.1", 14041)
+ 
+ 
+ class FakeViewer:
+@@ -115,12 +166,26 @@ def run_fake_live_session(
+     quaternion_order: str = "xyzw",
+     flexion_gain: float = 1.0,
+     filter_cutoff_hz: float = 12.0,
++    batch_sizes: list[int] | None = None,
++    stale_packets: list[bytes] | None = None,
+     **run_kwargs,
+ ) -> np.ndarray:
+-    """Jalankan ``smartglove.runtime.run`` dan kembalikan qpos (frame x nq)."""
++    """Jalankan ``smartglove.runtime.run`` dan kembalikan qpos (frame x nq).
++
++    ``stale_packets`` disuntik ke buffer soket saat prompt Enter kedua (sebelum
++    kalibrasi genggam), seperti paket yang menumpuk selama pengguna menunggu.
++    """
+     from smartglove import runtime
+ 
+-    state = SimpleNamespace(exhausted=False)
++    state = SimpleNamespace(exhausted=False, sockets=[])
++    prompts = {"count": 0}
++
++    def fake_input(*args: object) -> str:
++        prompts["count"] += 1
++        if prompts["count"] == 2 and stale_packets:
++            state.sockets[0].inject(list(stale_packets))
++        return ""
++
+     packets = session_packets() if packets is None else packets
+     clock = {"t": 1000.0}
+ 
+@@ -129,7 +194,7 @@ def run_fake_live_session(
+         return clock["t"]
+ 
+     fake_socket_module = SimpleNamespace(
+-        socket=lambda *a, **k: FakeSocket(packets, state),
++        socket=lambda *a, **k: FakeSocket(packets, state, batch_sizes),
+         AF_INET=real_socket.AF_INET,
+         SOCK_DGRAM=real_socket.SOCK_DGRAM,
+         SOL_SOCKET=real_socket.SOL_SOCKET,
+@@ -145,7 +210,7 @@ def run_fake_live_session(
+         mock.patch.object(runtime, "time", fake_time),
+         mock.patch.object(runtime.mujoco, "viewer", fake_viewer_module),
+         mock.patch.object(runtime, "SmartGloveMuscleController", RecordingController),
+-        mock.patch.object(builtins, "input", lambda *a: ""),
++        mock.patch.object(builtins, "input", fake_input),
+     ):
+         runtime.run(quaternion_order, flexion_gain, filter_cutoff_hz, **run_kwargs)
+     return np.array(RecordingController.qpos_log)
+diff --git a/test/test_frame_recorder.py b/test/test_frame_recorder.py
+index dae4477..82c4b4b 100644
+--- a/test/test_frame_recorder.py
++++ b/test/test_frame_recorder.py
+@@ -8,11 +8,13 @@ from smartglove.frame import (
+     SENSOR_NAMES,
+     Event,
+     RecordingError,
++    check_meta,
+     count_glove_seq_gaps,
+     dumps,
+     frame_from_parsed,
+     frame_to_parsed,
+     frame_to_record,
++    glove_time_seconds,
+     record_to_frame,
+ )
+ from smartglove.recorder import JsonlRecorder, build_meta, read_recording
+@@ -91,6 +93,49 @@ class FrameTests(unittest.TestCase):
+         with self.assertRaisesRegex(RecordingError, "norma"):
+             record_to_frame(record)
+ 
++    def test_unprocessed_flag_round_trips_and_is_omitted_when_true(self) -> None:
++        processed = frame_from_parsed(synthetic_parsed(), n=1, t=0.0)
++        skipped = frame_from_parsed(synthetic_parsed(), n=2, t=0.0, processed=False)
++        self.assertNotIn("proc", frame_to_record(processed))
++        self.assertIs(frame_to_record(skipped)["proc"], False)
++        self.assertEqual(record_to_frame(json.loads(dumps(frame_to_record(skipped)))), skipped)
++        self.assertTrue(record_to_frame(json.loads(dumps(frame_to_record(processed)))).processed)
++
++    def test_missing_proc_means_processed_for_older_recordings(self) -> None:
++        record = frame_to_record(frame_from_parsed(synthetic_parsed(), n=1, t=0.0))
++        record.pop("proc", None)
++        self.assertTrue(record_to_frame(record).processed)
++
++    def test_non_boolean_proc_is_rejected(self) -> None:
++        record = frame_to_record(frame_from_parsed(synthetic_parsed(), n=1, t=0.0))
++        record["proc"] = "no"
++        with self.assertRaisesRegex(RecordingError, "proc"):
++            record_to_frame(record)
++
++    def test_meta_capture_must_be_known_and_defaults_to_processed(self) -> None:
++        meta = make_meta()
++        meta.pop("capture")
++        check_meta(meta)  # rekaman 1.0 tanpa capture tetap sah
++        meta["capture"] = "everything"
++        with self.assertRaisesRegex(RecordingError, "capture"):
++            check_meta(meta)
++
++    def test_glove_time_uses_ticks_in_milliseconds_from_zero(self) -> None:
++        frames = [
++            frame_from_parsed(synthetic_parsed(), n=i + 1, t=0.0, glove_tick=tick)
++            for i, tick in enumerate((5000, 5012, 5012, 5060))
++        ]
++        self.assertEqual(glove_time_seconds(frames), [0.0, 0.012, 0.012, 0.06])
++
++    def test_glove_time_rejects_missing_or_decreasing_ticks(self) -> None:
++        good = frame_from_parsed(synthetic_parsed(), n=1, t=0.0, glove_tick=100)
++        no_tick = frame_from_parsed(synthetic_parsed(), n=2, t=0.0)
++        back = frame_from_parsed(synthetic_parsed(), n=3, t=0.0, glove_tick=50)
++        with self.assertRaisesRegex(RecordingError, "glove_tick"):
++            glove_time_seconds([good, no_tick])
++        with self.assertRaisesRegex(RecordingError, "turun"):
++            glove_time_seconds([good, back])
++
+     def test_glove_seq_gap_counting(self) -> None:
+         frames = [
+             frame_from_parsed(synthetic_parsed(), n=i + 1, t=i * 0.01, glove_seq=seq)
+@@ -162,7 +207,8 @@ class RecorderTests(unittest.TestCase):
+ 
+     def test_meta_carries_required_fields(self) -> None:
+         meta = make_meta()
+-        self.assertEqual(meta["schema"], "smartglove.frame/1")
++        self.assertEqual(meta["schema"], "smartglove.frame/1.1")
++        self.assertEqual(meta["capture"], "processed")
+         self.assertEqual(meta["quat_order"], "xyzw")
+         self.assertEqual(meta["packet_bytes"], 624)
+         self.assertIn("THUMB", meta["sensor_slots"])
+@@ -249,6 +295,14 @@ class RecorderTests(unittest.TestCase):
+         with self.assertRaisesRegex(RecordingError, "meta"):
+             read_recording(self.path)
+ 
++    def test_ended_cleanly_requires_session_end_event(self) -> None:
++        self.write_sample()
++        self.assertFalse(read_recording(self.path).ended_cleanly)
++        with JsonlRecorder(self.path, make_meta()) as recorder:
++            recorder.write_frame(frame_from_parsed(synthetic_parsed(), 1, 0.0))
++            recorder.write_event("session_end", 1, 0.0, frames=1)
++        self.assertTrue(read_recording(self.path).ended_cleanly)
++
+     def test_empty_file_is_rejected(self) -> None:
+         self.path.parent.mkdir(parents=True)
+         self.path.write_text("")
+diff --git a/test/test_runtime_replay.py b/test/test_runtime_replay.py
+index 23f0a85..52f42a6 100644
+--- a/test/test_runtime_replay.py
++++ b/test/test_runtime_replay.py
+@@ -73,8 +73,15 @@ class LiveAndReplayTests(unittest.TestCase):
+         names = [e.name for e in self.recording.events]
+         self.assertEqual(
+             names,
+-            ["calib_open_start", "calib_open_done", "calib_grip_start", "calib_grip_done"],
++            [
++                "calib_open_start", "calib_open_done", "calib_grip_start",
++                "calib_grip_done", "session_end",
++            ],
+         )
++        self.assertTrue(self.recording.ended_cleanly)
++        end = self.recording.events[-1].payload
++        self.assertEqual((end["frames"], end["processed"], end["invalid_skipped"]), (total, total, 0))
++        self.assertEqual(end["capture"], "processed")
+         open_done = self.recording.events[1]
+         self.assertEqual(open_done.n, fakes.OPEN_PACKETS)
+         self.assertEqual(
+@@ -180,6 +187,7 @@ class FailedGripRetryTests(unittest.TestCase):
+                     ("calib_grip_done", 1, False),
+                     ("calib_grip_start", 2, None),
+                     ("calib_grip_done", 2, True),
++                    ("session_end", None, None),
+                 ],
+             )
+             self.assertIn("error", recording.events[3].payload)
+@@ -192,3 +200,223 @@ class FailedGripRetryTests(unittest.TestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main()
++
++
++class RecordAllTests(unittest.TestCase):
++    """Mode --record-all: semua paket valid direkam, pemrosesan tidak berubah."""
++
++    OPEN_BATCHES = 30
++    GRIP_BATCHES = 30
++    BATCH = 3
++
++    @classmethod
++    def build_plan(cls) -> dict:
++        n_open = cls.OPEN_BATCHES * cls.BATCH
++        n_grip = cls.GRIP_BATCHES * cls.BATCH
++        n_stale, n_motion = 40, 110
++        ordered = fakes.renumber_packets(
++            fakes.load_packets(fakes.OPEN_DIR, 0, n_open)
++            + fakes.load_packets(fakes.OPEN_DIR, n_open, n_stale)
++            + fakes.load_packets(fakes.GRIP_AND_MOTION_DIR, 0, n_grip + n_motion)
++        )
++        open_ = ordered[:n_open]
++        stale = ordered[n_open : n_open + n_stale]
++        rest = ordered[n_open + n_stale :]
++        main = open_ + rest
++        sizes = (
++            [cls.BATCH] * cls.OPEN_BATCHES
++            + [cls.BATCH] * cls.GRIP_BATCHES
++            + fakes.batch_sizes_for(n_motion)
++        )
++        assert sum(sizes) == len(main)
++        # urutan waktu sebenarnya: open, stale, lalu sisanya
++        time_order_mask = []
++        cursor = 0
++        for index, size in enumerate(sizes):
++            mask = [False] * (size - 1) + [True]
++            time_order_mask.extend(mask)
++            cursor += size
++            if index == cls.OPEN_BATCHES - 1:
++                time_order_mask.extend([False] * n_stale)
++        last_of_batch = []
++        cursor = 0
++        for size in sizes:
++            last_of_batch.append(main[cursor + size - 1])
++            cursor += size
++        return dict(
++            main=main, stale=stale, sizes=sizes, processed_mask=time_order_mask,
++            reference=last_of_batch, total=len(main) + n_stale,
++        )
++
++    @classmethod
++    def setUpClass(cls) -> None:
++        cls._directory = tempfile.TemporaryDirectory()
++        cls.addClassCleanup(cls._directory.cleanup)
++        directory = Path(cls._directory.name)
++        cls.plan = cls.build_plan()
++        cls.path_all = directory / "all.jsonl"
++        cls.path_processed = directory / "processed.jsonl"
++        plan = cls.plan
++        try:
++            cls.qpos_all = quiet(
++                fakes.run_fake_live_session, packets=plan["main"],
++                batch_sizes=plan["sizes"], stale_packets=plan["stale"],
++                record_path=cls.path_all, record_all=True,
++            )
++        except ValueError as error:
++            if "Objek MuJoCo tidak ditemukan" in str(error):
++                raise unittest.SkipTest("model MyoSuite tidak cocok") from error
++            raise
++        cls.qpos_processed = quiet(
++            fakes.run_fake_live_session, packets=plan["main"],
++            batch_sizes=plan["sizes"], stale_packets=plan["stale"],
++            record_path=cls.path_processed,
++        )
++        cls.qpos_reference = quiet(
++            fakes.run_fake_live_session, packets=plan["reference"]
++        )
++        cls.rec_all = read_recording(cls.path_all)
++        cls.rec_processed = read_recording(cls.path_processed)
++
++    # ------------------------------------------------------------ pemrosesan
++
++    def test_recording_everything_does_not_change_the_live_output(self) -> None:
++        self.assertTrue(np.array_equal(self.qpos_all, self.qpos_processed))
++        self.assertTrue(np.array_equal(self.qpos_all, self.qpos_reference))
++
++    # --------------------------------------------------------------- rekaman
++
++    def test_every_packet_is_recorded_in_order_without_gaps(self) -> None:
++        frames = self.rec_all.frames
++        self.assertEqual(len(frames), self.plan["total"])
++        self.assertEqual([f.n for f in frames], list(range(1, self.plan["total"] + 1)))
++        from smartglove.frame import count_glove_seq_gaps
++        self.assertEqual(count_glove_seq_gaps(frames), 0)
++        ticks = [f.glove_tick for f in frames]
++        self.assertEqual({b - a for a, b in zip(ticks, ticks[1:])}, {12})
++        self.assertEqual(self.rec_all.capture, "all")
++
++    def test_only_the_last_packet_of_each_batch_is_marked_processed(self) -> None:
++        flags = [f.processed for f in self.rec_all.frames]
++        self.assertEqual(flags, self.plan["processed_mask"])
++        self.assertEqual(sum(flags), len(self.plan["sizes"]))
++
++    def test_packets_that_piled_up_during_the_prompt_are_recorded(self) -> None:
++        items = self.rec_all.items
++        names = [(i, it.name) for i, it in enumerate(items) if hasattr(it, "name")]
++        open_done = next(i for i, n in names if n == "calib_open_done")
++        grip_start = next(i for i, n in names if n == "calib_grip_start")
++        between = items[open_done + 1 : grip_start]
++        self.assertEqual(len(between), len(self.plan["stale"]))
++        self.assertTrue(all(not f.processed for f in between))
++        self.assertEqual(items[grip_start].n, self.OPEN_BATCHES * self.BATCH + len(self.plan["stale"]))
++
++    def test_processed_only_recording_of_the_same_session_stays_small(self) -> None:
++        frames = self.rec_processed.frames
++        self.assertEqual(len(frames), len(self.plan["sizes"]))
++        self.assertTrue(all(f.processed for f in frames))
++        self.assertEqual(self.rec_processed.capture, "processed")
++
++    def test_session_end_reports_counts(self) -> None:
++        end = self.rec_all.events[-1]
++        self.assertEqual(end.name, "session_end")
++        self.assertEqual(end.payload["capture"], "all")
++        self.assertEqual(end.payload["frames"], self.plan["total"])
++        self.assertEqual(end.payload["processed"], len(self.plan["sizes"]))
++        self.assertEqual(end.payload["invalid_skipped"], 0)
++
++    # ---------------------------------------------------------------- replay
++
++    def test_replay_processed_on_a_record_all_file_equals_live(self) -> None:
++        result = replay_quiet(self.path_all, frames="processed")
++        self.assertTrue(np.array_equal(result.qpos, self.qpos_all))
++        self.assertEqual(result.warnings, [])
++        self.assertEqual(result.frames_total, self.plan["total"])
++
++    def test_replay_all_maps_every_frame_after_calibration(self) -> None:
++        grip_done = next(e for e in self.rec_all.events if e.name == "calib_grip_done")
++        expected = self.plan["total"] - grip_done.n + 1
++        result = replay_quiet(self.path_all, frames="all")
++        self.assertEqual(result.warnings, [])
++        self.assertEqual(result.frames_mapped, expected)
++        self.assertGreater(result.frames_mapped, len(self.qpos_all))
++        # frame penutup kalibrasi dipetakan sama persis seperti saat live
++        self.assertTrue(np.array_equal(result.qpos[0], self.qpos_all[0]))
++
++    def test_replay_all_is_deterministic_and_stored_matches_recompute(self) -> None:
++        first = replay_quiet(self.path_all, frames="all").qpos
++        second = replay_quiet(self.path_all, frames="all").qpos
++        stored = replay_quiet(self.path_all, frames="all", mode="stored").qpos
++        self.assertTrue(np.array_equal(first, second))
++        self.assertTrue(np.array_equal(first, stored))
++
++    def test_replay_all_skips_consecutive_duplicate_sequence_numbers(self) -> None:
++        from dataclasses import replace
++        from smartglove.frame import Frame
++
++        target = self.plan["total"] - 20
++        duplicated = Path(self._directory.name) / "duplicated.jsonl"
++        with JsonlRecorder(duplicated, self.rec_all.meta) as recorder:
++            for item in self.rec_all.items:
++                if isinstance(item, Frame):
++                    if item.n > target:
++                        recorder.write_frame(replace(item, n=item.n + 1))
++                    else:
++                        recorder.write_frame(item)
++                    if item.n == target:
++                        recorder.write_frame(replace(item, n=item.n + 1))
++                else:
++                    recorder.write_event(item.name, item.n, item.t, **item.payload)
++        baseline = replay_quiet(self.path_all, frames="all")
++        result = replay_quiet(duplicated, frames="all")
++        self.assertEqual(result.frames_total, baseline.frames_total + 1)
++        self.assertEqual(result.frames_mapped, baseline.frames_mapped)
++        self.assertTrue(np.array_equal(result.qpos, baseline.qpos))
++
++    def test_replay_all_on_a_processed_only_recording_warns(self) -> None:
++        result = replay_quiet(self.path_processed, frames="all")
++        self.assertTrue(any("capture=processed" in w for w in result.warnings), result.warnings)
++        self.assertEqual(result.frames_mapped, len(self.qpos_processed))
++
++    def test_recording_without_session_end_produces_a_warning(self) -> None:
++        lines = [l for l in self.path_all.read_text().split("\n") if '"session_end"' not in l]
++        crashed = Path(self._directory.name) / "crashed.jsonl"
++        crashed.write_text("\n".join(lines))
++        result = replay_quiet(crashed)
++        self.assertTrue(any("session_end" in w for w in result.warnings), result.warnings)
++
++
++class RecordAllInvalidPacketTests(unittest.TestCase):
++    def test_invalid_packets_are_counted_and_a_bad_last_packet_skips_only_processing(self) -> None:
++        plan = RecordAllTests.build_plan()
++        main, sizes = list(plan["main"]), list(plan["sizes"])
++        starts = [sum(sizes[:i]) for i in range(len(sizes))]
++        motion_batches = [i for i, size in enumerate(sizes) if i >= 60 and size >= 3]
++        middle_batch, last_batch = motion_batches[0], motion_batches[1]
++        main[starts[middle_batch] + 1] = main[starts[middle_batch] + 1][:100]
++        main[starts[last_batch] + sizes[last_batch] - 1] = main[starts[last_batch] + sizes[last_batch] - 1][:100]
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / "invalid.jsonl"
++            try:
++                qpos = quiet(
++                    fakes.run_fake_live_session, packets=main, batch_sizes=sizes,
++                    stale_packets=plan["stale"], record_path=path, record_all=True,
++                )
++            except ValueError as error:
++                if "Objek MuJoCo tidak ditemukan" in str(error):
++                    self.skipTest("model MyoSuite tidak cocok")
++                raise
++            recording = read_recording(path)
++            end = recording.events[-1].payload
++            self.assertEqual(end["invalid_skipped"], 2)
++            self.assertEqual(len(recording.frames), plan["total"] - 2)
++            self.assertEqual(end["processed"], len(sizes) - 1)
++            # batch dengan paket terakhir rusak: paket valid sebelumnya tetap terekam
++            self.assertEqual(
++                sum(1 for f in recording.frames if not f.processed),
++                (plan["total"] - len(sizes)) - 2 + 1,
++            )
++            baseline_rows = len(plan["sizes"]) - 60 + 1
++            self.assertEqual(len(qpos), baseline_rows - 1)
++            from smartglove.frame import count_glove_seq_gaps
++            self.assertEqual(count_glove_seq_gaps(recording.frames), 2)

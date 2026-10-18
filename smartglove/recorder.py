@@ -65,6 +65,7 @@ def build_meta(
     hand: str | None = None,
     device: str = "rokoko-smartglove-v1",
     packet_bytes: int = DEFAULT_PACKET_BYTES,
+    capture: str = "processed",
 ) -> dict[str, Any]:
     meta = {
         "type": "meta",
@@ -75,6 +76,7 @@ def build_meta(
         "packet_bytes": packet_bytes,
         "quat_order": quat_order,
         "quat_normalized": True,
+        "capture": capture,
         "sensor_slots": dict(SENSOR_SLOTS),
         "source": source,
         "app_commit": _git_commit(),
@@ -157,6 +159,16 @@ class Recording:
     @property
     def events(self) -> list[Event]:
         return [item for item in self.items if isinstance(item, Event)]
+
+    @property
+    def capture(self) -> str:
+        return self.meta.get("capture", "processed")
+
+    @property
+    def ended_cleanly(self) -> bool:
+        """True bila rekaman ditutup dengan event ``session_end`` (tidak crash)."""
+        events = self.events
+        return bool(events) and events[-1].name == "session_end"
 
 
 def read_recording(path: str | Path, tolerate_truncated_tail: bool = True) -> Recording:

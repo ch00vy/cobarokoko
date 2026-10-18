@@ -1,0 +1,102 @@
+diff --git a/smartglove/calibration.py b/smartglove/calibration.py
+index 611eb6d..8ca823c 100644
+--- a/smartglove/calibration.py
++++ b/smartglove/calibration.py
+@@ -214,9 +214,13 @@ class CalibrationSession:
+     ) -> None:
+         """Pasang kalibrasi dari payload event tanpa mengonsumsi frame.
+ 
+-        Filter tidak di-reset di sini: ``QuaternionLowPassFilter`` menginisialisasi
+-        diri dari frame pertama yang dipetakan, sama seperti reset pada frame
+-        penutup kalibrasi genggam di jalur live.
++        Filter tidak di-reset di sini. Pemanggil harus memanggil
++        ``quaternion_filter.reset(quaternion frame pertama, waktunya)`` tepat
++        sebelum memetakan frame pertama, seperti pada frame penutup kalibrasi
++        genggam di jalur live. Inisialisasi malas oleh ``update()`` TIDAK setara
++        bit-per-bit: reset lalu update pada waktu yang sama menormalisasi ulang
++        quaternion, dan normalisasi ulang tidak selalu idempoten (pada rekaman
++        nyata ~0,6% quaternion berubah 1 ulp).
+         """
+         if not grip_payload.get("ok", False):
+             raise ValueError("Payload genggam bukan percobaan yang berhasil.")
+diff --git a/smartglove/runtime.py b/smartglove/runtime.py
+index ab60fd1..b48d268 100644
+--- a/smartglove/runtime.py
++++ b/smartglove/runtime.py
+@@ -566,6 +566,7 @@ def replay(
+         qpos_log: list[np.ndarray] = []
+         frames_total = 0
+         last_seq: int | None = None
++        filter_primed = not use_stored
+         viewer_context = (
+             mujoco.viewer.launch_passive(pipeline.model, pipeline.data)
+             if show_viewer
+@@ -613,6 +614,14 @@ def replay(
+                 else:
+                     quats = frame_quaternions(item, order)
+ 
++                if not filter_primed:
++                    # Mode stored: jalur live dan recompute melakukan reset(frame
++                    # penutup) lalu update pada waktu yang sama. Meniru urutan
++                    # operasi itu persis; inisialisasi malas oleh update() tidak
++                    # setara bit-per-bit (normalisasi ulang tidak selalu idempoten).
++                    pipeline.quaternion_filter.reset(quats, item.t)
++                    filter_primed = True
++
+                 qpos_log.append(map_frame(pipeline, quats, item.t))
+                 if viewer is not None:
+                     if realtime and previous_t is not None:
+diff --git a/test/test_runtime_replay.py b/test/test_runtime_replay.py
+index 52f42a6..204e936 100644
+--- a/test/test_runtime_replay.py
++++ b/test/test_runtime_replay.py
+@@ -350,6 +350,49 @@ class RecordAllTests(unittest.TestCase):
+         self.assertTrue(np.array_equal(first, second))
+         self.assertTrue(np.array_equal(first, stored))
+ 
++    def test_stored_mode_primes_the_filter_exactly_like_the_live_path(self) -> None:
++        """Struktural (tidak bergantung pada angka floating-point platform).
++
++        Live dan recompute memanggil reset(frame penutup) lalu update() pada
++        waktu yang sama. Mode stored harus menjalankan urutan operasi filter
++        yang sama persis pada frame pertama yang dipetakan, bukan membiarkan
++        update() menginisialisasi secara malas (itu tidak setara bit-per-bit).
++        """
++        from smartglove.quaternion import QuaternionLowPassFilter
++
++        def filter_calls(**kwargs) -> list[tuple]:
++            calls: list[tuple] = []
++            original_reset = QuaternionLowPassFilter.reset
++            original_update = QuaternionLowPassFilter.update
++
++            def spy_reset(self, orientations, timestamp):
++                calls.append(("reset", timestamp))
++                return original_reset(self, orientations, timestamp)
++
++            def spy_update(self, orientations, timestamp):
++                calls.append(("update", timestamp, self.last_time is None))
++                return original_update(self, orientations, timestamp)
++
++            with (
++                mock.patch.object(QuaternionLowPassFilter, "reset", spy_reset),
++                mock.patch.object(QuaternionLowPassFilter, "update", spy_update),
++            ):
++                replay_quiet(self.path_all, **kwargs)
++            return calls
++
++        for frames in ("processed", "all"):
++            recompute = filter_calls(frames=frames)
++            stored = filter_calls(frames=frames, mode="stored")
++            first_mapped = recompute.index(
++                next(c for c in recompute if c[0] == "update" and c[2] is False)
++            )
++            # urutan di sekitar frame penutup genggam: reset(t) lalu update(t) dengan filter sudah terisi
++            self.assertEqual(recompute[first_mapped - 1][0], "reset", frames)
++            tail = recompute[first_mapped - 1 : first_mapped + 1]
++            self.assertEqual(stored[:2], tail, frames)
++            # dan seterusnya identik: hanya update biasa pada waktu yang sama
++            self.assertEqual(stored[2:], recompute[first_mapped + 1 :], frames)
++
+     def test_replay_all_skips_consecutive_duplicate_sequence_numbers(self) -> None:
+         from dataclasses import replace
+         from smartglove.frame import Frame

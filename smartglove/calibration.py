@@ -214,9 +214,13 @@ class CalibrationSession:
     ) -> None:
         """Pasang kalibrasi dari payload event tanpa mengonsumsi frame.
 
-        Filter tidak di-reset di sini: ``QuaternionLowPassFilter`` menginisialisasi
-        diri dari frame pertama yang dipetakan, sama seperti reset pada frame
-        penutup kalibrasi genggam di jalur live.
+        Filter tidak di-reset di sini. Pemanggil harus memanggil
+        ``quaternion_filter.reset(quaternion frame pertama, waktunya)`` tepat
+        sebelum memetakan frame pertama, seperti pada frame penutup kalibrasi
+        genggam di jalur live. Inisialisasi malas oleh ``update()`` TIDAK setara
+        bit-per-bit: reset lalu update pada waktu yang sama menormalisasi ulang
+        quaternion, dan normalisasi ulang tidak selalu idempoten (pada rekaman
+        nyata ~0,6% quaternion berubah 1 ulp).
         """
         if not grip_payload.get("ok", False):
             raise ValueError("Payload genggam bukan percobaan yang berhasil.")
