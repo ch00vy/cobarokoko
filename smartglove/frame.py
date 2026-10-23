@@ -7,8 +7,9 @@ Satu file rekaman berisi baris-baris JSON dengan tiga jenis ``type``:
 * ``frame`` - satu paket UDP valid. Pada ``capture: "processed"`` hanya paket
   yang diproses mapper; pada ``capture: "all"`` semua paket valid yang diterima,
   dan paket yang tidak diproses saat live ditandai ``"proc": false``.
-* ``event`` - penanda tahap kerja (kalibrasi terbuka/genggam, catatan,
-  ``session_end`` bila sesi berakhir normal).
+* ``event`` - penanda tahap kerja dan data hasil mapping (kalibrasi, event
+  ``mapping_frame`` per frame yang dipetakan, dan ``session_end`` bila sesi
+  berakhir normal).
 
 Prinsip desain:
 

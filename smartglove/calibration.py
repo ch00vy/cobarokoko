@@ -199,11 +199,62 @@ class CalibrationSession:
         self.last_error = None
         self.quaternion_filter.reset(quats, frame.t)
         self.last_grip_payload = {
-            **payload, "ok": True, "skipped": self.skipped_fingers, "error": None,
+            **payload,
+            "ok": True,
+            "skipped": self.skipped_fingers,
+            "error": None,
+            "mapping_calibration": self._mapping_calibration_payload(),
         }
         self.phase = "ready"
         self._emit_event("calib_grip_done", frame.n, frame.t, **self.last_grip_payload)
         return "grip_done"
+
+    def _mapping_calibration_payload(self) -> dict[str, Any]:
+        finger_calibration = self.mapper.flexion_calibration
+        if finger_calibration is None or self.mapper.sensor_to_model is None:
+            raise RuntimeError("Kalibrasi pemetaan jari belum lengkap.")
+
+        fingers: dict[str, Any] = {}
+        for finger, value in finger_calibration.items():
+            if value is None:
+                fingers[finger] = None
+                continue
+            closure_axis, closed_angle, targets = value
+            joint_names = dict(
+                zip(
+                    self.mapper.fingers[finger]["qpos"],
+                    FINGER_JOINTS[finger]["joints"],
+                )
+            )
+            fingers[finger] = {
+                "closure_axis": closure_axis.tolist(),
+                "closed_angle_rad": float(closed_angle),
+                "targets": [
+                    {
+                        "joint": joint_names[qpos_id],
+                        "qpos_index": int(qpos_id),
+                        "open": float(target_open),
+                        "closed": float(target_closed),
+                    }
+                    for qpos_id, (target_open, target_closed, _) in targets.items()
+                ],
+            }
+
+        wrist = self.wrist_mapper
+        return {
+            "hand_sensor_to_model": {
+                name: quaternion.tolist()
+                for name, quaternion in self.mapper.sensor_to_model.items()
+            },
+            "finger_flexion": fingers,
+            "wrist": {
+                "alignment": wrist.alignment.tolist(),
+                "alignment_source": wrist.alignment_source,
+                "twist_axis": (
+                    None if wrist.twist_axis is None else wrist.twist_axis.tolist()
+                ),
+            },
+        }
 
     # ---------------------------------------------------------- mode "stored"
 

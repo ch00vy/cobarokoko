@@ -10,8 +10,9 @@ from datetime import datetime
 # CONFIGURATION
 # ============================================================
 
-HOST = "192.168.3.101"
+HOST = "192.168.3.167"
 PORT = 14041
+DEFAULT_BIND_HOST = "0.0.0.0"
 
 PACKET_SIZE = 624
 RATE_WINDOW_INTERVALS = 30

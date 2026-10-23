@@ -70,7 +70,9 @@ class LiveAndReplayTests(unittest.TestCase):
         self.assertEqual(len(frames), total)
         self.assertEqual([f.n for f in frames], list(range(1, total + 1)))
         self.assertTrue(all(f.glove_seq is not None for f in frames))
-        names = [e.name for e in self.recording.events]
+        names = [
+            e.name for e in self.recording.events if e.name != "mapping_frame"
+        ]
         self.assertEqual(
             names,
             [
@@ -92,6 +94,30 @@ class LiveAndReplayTests(unittest.TestCase):
         self.assertTrue(grip_done.payload["ok"])
         self.assertEqual(grip_done.n, fakes.OPEN_PACKETS + fakes.GRIP_PACKETS)
         self.assertEqual(set(grip_done.payload["grip"]), {"THUMB", "INDEX", "MIDDLE", "RING", "PINKY"})
+        mapping_calibration = grip_done.payload["mapping_calibration"]
+        self.assertEqual(
+            set(mapping_calibration["hand_sensor_to_model"]),
+            {"THUMB", "INDEX", "MIDDLE", "RING", "PINKY"},
+        )
+        self.assertTrue(
+            all(
+                target["joint"] and "qpos_index" in target
+                for target in mapping_calibration["finger_flexion"]["INDEX"][
+                    "targets"
+                ]
+            )
+        )
+        self.assertIn("alignment", mapping_calibration["wrist"])
+        mapping_frames = [
+            event for event in self.recording.events if event.name == "mapping_frame"
+        ]
+        self.assertEqual(len(mapping_frames), len(self.live_qpos))
+        first_mapping = mapping_frames[0].payload
+        np.testing.assert_array_equal(first_mapping["qpos"], self.live_qpos[0])
+        self.assertIn("joint_positions", first_mapping)
+        self.assertIn("actuator_controls", first_mapping)
+        self.assertIn("filtered_quaternions", first_mapping)
+        self.assertEqual(set(first_mapping["wrist"]), {"angles_deg", "saturated"})
 
     def test_meta_records_session_parameters(self) -> None:
         meta = self.recording.meta
@@ -100,6 +126,14 @@ class LiveAndReplayTests(unittest.TestCase):
         self.assertEqual(meta["params"]["calibration_packets"], 30)
         self.assertEqual(meta["quat_order"], "xyzw")
         self.assertIn("sha256", meta["wrist_axes"])
+
+    def test_live_listener_binds_to_all_interfaces_by_default(self) -> None:
+        from smartglove_realtime import DEFAULT_BIND_HOST, PORT
+
+        self.assertEqual(
+            fakes.FakeSocket.last_bound_address,
+            (DEFAULT_BIND_HOST, PORT),
+        )
 
     # -------------------------------------------------------------- replay
 
@@ -177,7 +211,11 @@ class FailedGripRetryTests(unittest.TestCase):
                     self.skipTest("model MyoSuite tidak cocok")
                 raise
             recording = read_recording(path)
-            events = [(e.name, e.payload.get("attempt"), e.payload.get("ok")) for e in recording.events]
+            events = [
+                (e.name, e.payload.get("attempt"), e.payload.get("ok"))
+                for e in recording.events
+                if e.name != "mapping_frame"
+            ]
             self.assertEqual(
                 events,
                 [
@@ -324,6 +362,10 @@ class RecordAllTests(unittest.TestCase):
         self.assertEqual(end.payload["frames"], self.plan["total"])
         self.assertEqual(end.payload["processed"], len(self.plan["sizes"]))
         self.assertEqual(end.payload["invalid_skipped"], 0)
+        mapping_frames = [
+            event for event in self.rec_all.events if event.name == "mapping_frame"
+        ]
+        self.assertEqual(len(mapping_frames), len(self.qpos_all))
 
     # ---------------------------------------------------------------- replay
 

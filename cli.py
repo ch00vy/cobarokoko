@@ -3,6 +3,7 @@ import math
 
 from smartglove.config import FILTER_CUTOFF_HZ
 from smartglove.runtime import replay, run
+from smartglove_realtime import DEFAULT_BIND_HOST
 
 
 def main() -> None:
@@ -34,9 +35,20 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--bind-host",
+        default=DEFAULT_BIND_HOST,
+        metavar="IPv4",
+        help=(
+            "Alamat IPv4 lokal untuk menerima UDP (default: 0.0.0.0, "
+            "semua interface). Glove tetap harus mengirim ke IP LAN PC."
+        ),
+    )
+    parser.add_argument(
         "--record",
         metavar="PATH.jsonl",
-        help="Rekam sesi live ke JSONL (frame yang diproses + event kalibrasi).",
+        help=(
+            "Rekam sesi live ke JSONL (frame, hasil pemetaan, dan event kalibrasi)."
+        ),
     )
     parser.add_argument(
         "--record-all",
@@ -104,6 +116,7 @@ def main() -> None:
                 ("--replay-frames", args.replay_frames != "processed"),
                 ("--no-viewer", args.no_viewer),
                 ("--no-realtime", args.no_realtime),
+                ("--bind-host", args.bind_host != DEFAULT_BIND_HOST),
             )
             if used
         ]
@@ -117,6 +130,7 @@ def main() -> None:
             FILTER_CUTOFF_HZ if args.filter_cutoff_hz is None else args.filter_cutoff_hz,
             record_path=args.record,
             record_all=args.record_all,
+            bind_host=args.bind_host,
         )
         return
 

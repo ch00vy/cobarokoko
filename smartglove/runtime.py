@@ -42,7 +42,7 @@ from smartglove.recorder import (
 from smartglove.wrist_alignment import DEFAULT_AXES_FILE
 from smartglove.wrist_mapping import WristQposMapper
 from smartglove_realtime import (
-    HOST,
+    DEFAULT_BIND_HOST,
     PORT,
     RATE_WINDOW_INTERVALS,
     calculate_packet_rate,
@@ -216,6 +216,49 @@ def format_status(
     )
 
 
+def record_mapping_frame(
+    recorder: JsonlRecorder | None,
+    frame: Frame,
+    qpos: np.ndarray,
+    pipeline: Pipeline,
+) -> None:
+    if recorder is None:
+        return
+
+    joint_positions: dict[str, float] = {}
+    for finger, specification in FINGER_JOINTS.items():
+        for name, qpos_id in zip(
+            specification["joints"], pipeline.mapper.fingers[finger]["qpos"]
+        ):
+            joint_positions[name] = float(qpos[qpos_id])
+    for name, qpos_id in zip(
+        pipeline.wrist_mapper.JOINT_NAMES, pipeline.wrist_mapper.qpos_ids
+    ):
+        joint_positions[name] = float(qpos[qpos_id])
+
+    recorder.write_event(
+        "mapping_frame",
+        frame.n,
+        frame.t,
+        filtered_quaternions={
+            name: quaternion.tolist()
+            for name, quaternion in pipeline.quaternion_filter.filtered.items()
+        },
+        qpos=qpos.tolist(),
+        joint_positions=joint_positions,
+        actuator_controls={
+            name: float(value)
+            for name, value in zip(
+                pipeline.muscle_controller.actuator_names, pipeline.data.ctrl
+            )
+        },
+        wrist={
+            "angles_deg": pipeline.wrist_mapper.last_angles_deg.tolist(),
+            "saturated": pipeline.wrist_mapper.saturated.tolist(),
+        },
+    )
+
+
 def session_params(flexion_gain: float, filter_cutoff_hz: float) -> dict:
     return {
         "env": ENV_NAME,
@@ -236,6 +279,7 @@ def run(
     filter_cutoff_hz: float,
     record_path: str | Path | None = None,
     record_all: bool = False,
+    bind_host: str = DEFAULT_BIND_HOST,
 ) -> None:
     if record_all and record_path is None:
         raise ValueError("record_all membutuhkan record_path.")
@@ -250,7 +294,7 @@ def run(
                 record_path,
                 build_meta(
                     quat_order=quaternion_order,
-                    source=f"{HOST}:{PORT}",
+                    source=f"{bind_host}:{PORT}",
                     params=session_params(flexion_gain, filter_cutoff_hz),
                     axes_file=DEFAULT_AXES_FILE,
                     capture="all" if record_all else "processed",
@@ -282,9 +326,20 @@ def run(
 
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
         sock.settimeout(0.01)
-        sock.bind((HOST, PORT))
+        try:
+            sock.bind((bind_host, PORT))
+        except OSError as error:
+            raise OSError(
+                error.errno,
+                (
+                    f"Gagal bind UDP ke {bind_host}:{PORT}. "
+                    "Default listener adalah 0.0.0.0 (semua interface); "
+                    "jika memakai alamat tertentu, pastikan IP itu terpasang "
+                    "pada PC. Konfigurasikan glove mengirim ke IP LAN PC."
+                ),
+            ) from error
 
-        print(f"[OK] UDP listener  : {HOST}:{PORT}")
+        print(f"[OK] UDP listener  : {bind_host}:{PORT}")
         print(
             f"[WAIT] Tahan tangan di pose netral. "
             f"Kalibrasi {CALIBRATION_PACKETS} paket..."
@@ -377,6 +432,7 @@ def run(
                     print("\n[OK] Kalibrasi terbuka dan genggam selesai.")
 
                 qpos = map_frame(pipeline, sensor_quaternions, frame.t)
+                record_mapping_frame(recorder, frame, qpos, pipeline)
 
                 if last_packet_time is not None:
                     interval = now - last_packet_time

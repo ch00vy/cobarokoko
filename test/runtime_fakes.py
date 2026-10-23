@@ -87,6 +87,8 @@ class FakeSocket:
     Default: satu paket per iterasi, sehingga drain selalu melihat antrean kosong.
     """
 
+    last_bound_address: tuple[str, int] | None = None
+
     def __init__(
         self,
         packets: list[bytes],
@@ -107,7 +109,9 @@ class FakeSocket:
         self._pending.extend(packets)
 
     def setsockopt(self, *args: object) -> None: ...
-    def bind(self, *args: object) -> None: ...
+    def bind(self, address: tuple[str, int]) -> None:
+        FakeSocket.last_bound_address = address
+
     def close(self) -> None: ...
 
     def setblocking(self, flag: bool) -> None:
@@ -155,7 +159,14 @@ class RecordingController:
 
     qpos_log: list[np.ndarray] = []
 
-    def __init__(self, model, data, finger_joints) -> None: ...
+    def __init__(self, model, data, finger_joints) -> None:
+        import mujoco
+
+        self.data = data
+        self.actuator_names = [
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, index)
+            for index in range(model.nu)
+        ]
 
     def update(self, qpos: np.ndarray) -> None:
         RecordingController.qpos_log.append(np.array(qpos, dtype=float).copy())
