@@ -166,6 +166,7 @@ class WristMappingTests(unittest.TestCase):
         mapper = WristQposMapper(
             fixture.model, fixture.data,
             sensor_axes={k: v["axis"] for k, v in axes.items()},
+            infer_forearm_twist=False,
         )
         s0 = fixture.sensors(np.zeros(3))
         mujoco.mj_resetData(fixture.model, fixture.data)
@@ -198,7 +199,7 @@ class WristMappingTests(unittest.TestCase):
 
 
 class ForearmTwistTests(unittest.TestCase):
-    def build_mapper(self, fixture, arm_world, with_twist=True):
+    def build_mapper(self, fixture, arm_world, with_twist=True, infer_twist=False):
         axes = {}
         for name, index, hi in (("flexion", 2, 60), ("deviation", 1, 25)):
             f, h = fixture.sweep(index, -5, hi)
@@ -207,7 +208,11 @@ class ForearmTwistTests(unittest.TestCase):
             axes["forearm_twist"] = principal_axis(
                 forearm_twist_rotvecs(pronation_sweep(fixture))
             )["axis"]
-        mapper = WristQposMapper(fixture.model, fixture.data, sensor_axes=axes)
+        mapper = WristQposMapper(
+            fixture.model, fixture.data, sensor_axes=axes,
+            infer_forearm_twist=infer_twist,
+            pronation_sign=1.0,
+        )
         s0 = fixture.sensors(np.zeros(3), arm_world, roll_forearm=True)
         mujoco.mj_resetData(fixture.model, fixture.data)
         mapper.calibrate(s0["FOREARM"], s0["HAND"])
@@ -238,6 +243,49 @@ class ForearmTwistTests(unittest.TestCase):
                 mapped[mapper.qpos_ids], (ps, dev, flex), atol=np.radians(0.3)
             )
 
+    def test_estimated_twist_tracks_both_directions_with_arbitrary_sensor_mounts(self):
+        for seed in (2, 7, 11, 19):
+            fixture = WristFixture(seed=seed)
+            arm = random_rotation(fixture.rng)
+            mapper = self.build_mapper(fixture, arm, with_twist=False, infer_twist=True)
+            self.assertEqual(mapper.twist_source, "estimated")
+            for ps, dev, flex in ((0.9, 0.1, 0.5), (-0.8, -0.1, -0.4), (0, 0, 0)):
+                target = np.array((ps, dev, flex))
+                result = mapper.map_frame(fixture.sensors(target, arm, roll_forearm=True))
+                np.testing.assert_allclose(result[mapper.qpos_ids], target, atol=np.radians(0.3))
+
+    def test_explicit_twist_calibration_takes_priority(self):
+        fixture = WristFixture(seed=23)
+        mapper = self.build_mapper(fixture, None, with_twist=True, infer_twist=True)
+        self.assertEqual(mapper.twist_source, "calibrated")
+
+    def test_project_configuration_enables_twist_by_default(self):
+        fixture = WristFixture(seed=29)
+        neutral = fixture.sensors(np.zeros(3), roll_forearm=True)
+        mapper = WristQposMapper(fixture.model, fixture.data)
+        mapper.calibrate(neutral["FOREARM"], neutral["HAND"])
+        self.assertEqual(mapper.twist_source, "estimated")
+        for angle in (0.6, -0.6):
+            forearm = quaternion_multiply(
+                neutral["FOREARM"], rotvec_to_quaternion(angle * mapper.twist_axis)
+            )
+            world_delta = quaternion_multiply(forearm, quaternion_conjugate(neutral["FOREARM"]))
+            hand = quaternion_multiply(world_delta, neutral["HAND"])
+            mapped = mapper.map_frame({"FOREARM": forearm, "HAND": hand})
+            np.testing.assert_allclose(mapped[mapper.qpos_ids], (-angle, 0, 0), atol=1e-5)
+
+    def test_reversed_pronation_preserves_flexion_and_deviation(self):
+        fixture = WristFixture(seed=31)
+        arm = random_rotation(fixture.rng)
+        mapper = self.build_mapper(fixture, arm, with_twist=False, infer_twist=True)
+        mapper.pronation_sign = -1.0
+        for angle in (0.7, -0.7):
+            target = np.array((angle, 0.1, 0.3))
+            mapped = mapper.map_frame(fixture.sensors(target, arm, roll_forearm=True))
+            np.testing.assert_allclose(
+                mapped[mapper.qpos_ids], (-angle, 0.1, 0.3), atol=np.radians(0.3)
+            )
+
     def test_flexion_saturation_does_not_leak_into_pronation(self) -> None:
         fixture = WristFixture(seed=13)
         arm = random_rotation(fixture.rng)
@@ -250,6 +298,19 @@ class ForearmTwistTests(unittest.TestCase):
         np.testing.assert_allclose(
             mapped[mapper.qpos_ids[:2]], target[:2], atol=np.radians(0.3)
         )
+
+    def test_pronation_saturation_is_reported_without_changing_other_joints(self) -> None:
+        fixture = WristFixture(seed=17)
+        arm = random_rotation(fixture.rng)
+        mapper = self.build_mapper(fixture, arm)
+        unlimited = WristFixture(seed=17)
+        unlimited.model.jnt_limited[:] = 0
+        for degrees in (110.0, -110.0, 30.0):
+            target = np.array((np.radians(degrees), 0.1, 0.2))
+            mapped = mapper.map_frame(unlimited.sensors(target, arm, roll_forearm=True))
+            expected = np.clip(target, mapper.lower, mapper.upper)
+            np.testing.assert_allclose(mapped[mapper.qpos_ids], expected, atol=np.radians(0.3))
+            self.assertEqual(bool(mapper.saturated[0]), abs(degrees) > 90.0)
 
 
 if __name__ == "__main__":

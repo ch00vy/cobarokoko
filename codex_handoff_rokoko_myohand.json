@@ -1,0 +1,211 @@
+{
+  "document_type": "codex_project_handoff",
+  "language": "id",
+  "project": "Evaluasi dan peningkatan mapping Rokoko Smartgloves ke MyoHand/MuJoCo",
+  "primary_goal": "Meningkatkan robustness dan naturalitas gerakan buka-tutup tangan kanan pada MyoHand agar lebih mendekati animasi Rokoko Studio.",
+  "experimental_setup": {
+    "gesture": "buka dan tutup tangan kanan",
+    "neutral_pose": "telapak tangan menghadap samping, seperti berjabat tangan",
+    "recordings": "Dua sesi berbeda dengan jenis gerakan sama; tidak identik secara temporal atau amplitudo",
+    "target_anatomy": "tangan kanan termasuk wrist hingga forearm",
+    "simulator": "MuJoCo",
+    "musculoskeletal_model": "MyoSuite MyoHand"
+  },
+  "available_files": [
+    {
+      "name": "Clip.fbx",
+      "role": "rekaman FBX awal, bukan pasangan utama uji2",
+      "bytes": 4384112
+    },
+    {
+      "name": "Clip_3.fbx",
+      "role": "referensi animasi Rokoko Studio untuk dibandingkan dengan uji2.jsonl",
+      "bytes": 4825712,
+      "format": "binary FBX; memerlukan evaluasi animasi skeleton"
+    },
+    {
+      "name": "uji2.jsonl",
+      "role": "rekaman sensor dan hasil kalibrasi/mapping buatan pengguna",
+      "bytes": 1762634,
+      "jsonl_record_types": {
+        "meta": 1,
+        "event": 468,
+        "frame": 523
+      },
+      "event_counts": {
+        "calib_open_start": 1,
+        "calib_open_done": 1,
+        "calib_grip_start": 1,
+        "calib_grip_done": 1,
+        "mapping_frame": 463,
+        "session_end": 1
+      }
+    },
+    {
+      "name": "runtime.zip",
+      "role": "program utama yang diunggah",
+      "zip_members": [
+        "runtime.py"
+      ],
+      "note": "modul smartglove dan control yang diimpor tidak disertakan"
+    },
+    {
+      "name": "extract_myohand_right.py",
+      "role": "skrip ekstraksi Blender yang disiapkan pada percakapan sebelumnya",
+      "status": "belum diverifikasi berjalan di Blender"
+    },
+    {
+      "name": "README_myohand_extraction.md",
+      "role": "panduan skrip ekstraksi"
+    }
+  ],
+  "jsonl_structure": {
+    "record_types": [
+      "meta",
+      "frame",
+      "event"
+    ],
+    "frame_fields": [
+      "n",
+      "t",
+      "glove_seq",
+      "glove_tick",
+      "s"
+    ],
+    "sensor_slots": {
+      "THUMB": 0,
+      "INDEX": 1,
+      "MIDDLE": 2,
+      "RING": 3,
+      "PINKY": 4,
+      "FOREARM": 5,
+      "HAND": 6
+    },
+    "quaternion_order": "xyzw",
+    "mapping_event_fields": [
+      "type",
+      "name",
+      "n",
+      "t",
+      "filtered_quaternions",
+      "qpos",
+      "joint_positions",
+      "actuator_controls",
+      "wrist"
+    ],
+    "qpos_length": 23,
+    "joint_positions_count": 23,
+    "actuator_controls_count": 39,
+    "calibration_events": [
+      "calib_open_start",
+      "calib_open_done",
+      "calib_grip_start",
+      "calib_grip_done"
+    ],
+    "caution": "qpos dan kontrol aktuator merupakan hasil mapping, bukan ground truth anatomis maupun pengukuran EMG"
+  },
+  "runtime_architecture": {
+    "entrypoint": "runtime.py",
+    "imports_of_interest": [
+      "smartglove.calibration.CalibrationSession",
+      "smartglove.mapping.HandQposMapper",
+      "smartglove.quaternion.QuaternionLowPassFilter",
+      "smartglove.wrist_mapping.WristQposMapper",
+      "control.smartglove_muscle_control.SmartGloveMuscleController"
+    ],
+    "conceptual_flow": [
+      "paket Rokoko",
+      "filter quaternion",
+      "mapping wrist",
+      "mapping finger/IK",
+      "qpos MyoHand",
+      "kontrol aktuator",
+      "MuJoCo"
+    ],
+    "missing_modules": [
+      "smartglove/calibration.py",
+      "smartglove/mapping.py",
+      "smartglove/quaternion.py",
+      "smartglove/wrist_mapping.py",
+      "smartglove/wrist_alignment.py",
+      "smartglove/config.py",
+      "smartglove/frame.py",
+      "smartglove/recorder.py",
+      "control/smartglove_muscle_control.py",
+      "smartglove_realtime.py"
+    ],
+    "note": "Jangan mengasumsikan implementasi rumus yang tidak ada di runtime.py."
+  },
+  "comparison_method": {
+    "principle": "Karena sesi berbeda, jangan sejajarkan berdasarkan indeks frame atau timestamp absolut.",
+    "steps": [
+      "Ekstrak animasi tulang tangan kanan dan forearm Clip_3.fbx per frame melalui Blender bpy atau FBX SDK.",
+      "Simpan rest pose, hierarki tulang, transformasi lokal dan global, orientasi dan posisi fingertip, FPS dan timestamp.",
+      "Baca event mapping_frame uji2.jsonl, qpos, joint_positions, filtered_quaternions, wrist dan actuator_controls.",
+      "Gunakan FK model XML MyoHand untuk merekonstruksi pose dan fingertip dari qpos.",
+      "Samakan koordinat, handedness, unit, rest pose, ukuran tangan dan forearm reference; dokumentasikan semua konversi.",
+      "Segmentasi gesture menjadi buka, transisi menutup, tutup, transisi membuka; sejajarkan berdasarkan fase/kemajuan gerak, pertimbangkan DTW dengan batasan untuk sesi berbeda.",
+      "Bandingkan orientasi segmen, sudut flexion/abduction, jarak fingertip relatif telapak, range of motion, saturasi, jitter, smoothness, lag, koordinasi jari dan konsistensi pose.",
+      "Pisahkan error pemetaan kinematik dari error kontrol otot dinamis.",
+      "Audit parameter kalibrasi, filter, gain, coupling, IK dan joint limits lalu uji ulang dengan replay data mentah."
+    ],
+    "metrics": [
+      "joint angle trajectories",
+      "range of motion",
+      "saturation fraction",
+      "fingertip-to-palm distances",
+      "segment orientation error",
+      "velocity/acceleration/jerk",
+      "cross-finger coordination",
+      "cycle-to-cycle consistency"
+    ],
+    "limitations": [
+      "Rokoko Studio merupakan referensi gerakan, bukan ground truth biomekanika.",
+      "Joint FBX dan MyoHand mungkin berbeda; perbandingan sudut langsung memerlukan definisi sumbu yang kompatibel.",
+      "Rekaman berbeda tidak memungkinkan frame-wise absolute error yang valid tanpa alignment berbasis gerakan."
+    ]
+  },
+  "suspected_issues_not_yet_confirmed": [
+    "gain terlalu besar",
+    "joint clipping/saturation",
+    "estimasi sumbu fleksi dan referensi kalibrasi kurang tepat",
+    "pembagian fleksi MCP/PIP/DIP dan distal coupling",
+    "filter menyebabkan lag atau jitter",
+    "perbedaan koordinat dan anatomi FBX vs MyoHand",
+    "kontrol aktuator tidak mereproduksi target qpos secara dinamis"
+  ],
+  "status": {
+    "verified_in_current_handoff": [
+      "File terpasang dan dapat dibaca.",
+      "runtime.zip berisi runtime.py saja.",
+      "uji2.jsonl memiliki 523 record frame, 463 mapping_frame, 1 meta, 5 event lainnya."
+    ],
+    "not_done": [
+      "Belum mengekstrak pose numerik dari Clip_3.fbx.",
+      "Belum menghitung metrik perbandingan FBX vs JSONL.",
+      "Belum memeriksa implementasi modul mapping/calibration yang tidak diunggah.",
+      "Belum memvalidasi qpos terhadap model XML MyoHand yang tepat."
+    ]
+  },
+  "instructions_for_codex": {
+    "first_actions": [
+      "Inspeksi repo kerja untuk modul smartglove, control, model XML MyoHand dan dependensi Blender.",
+      "Validasi skema, urutan qpos, nama joint, unit dan urutan quaternion sebelum konversi.",
+      "Implementasikan ekstraksi FBX dan evaluasi komparatif yang dapat direproduksi.",
+      "Laporkan metrik terukur dan rekomendasi perubahan kode spesifik; jangan menyatakan hipotesis sebagai temuan."
+    ],
+    "expected_outputs": [
+      "right_hand_forearm_reference.json",
+      "comparison_metrics.json",
+      "comparison_plots/",
+      "analysis_report.md",
+      "patches/tests untuk mapping jika kode lengkap tersedia"
+    ],
+    "constraints": [
+      "Jangan membandingkan indeks frame secara langsung.",
+      "Jangan mengubah file sumber.",
+      "Pertahankan pose netral berjabat tangan sebagai referensi orientasi.",
+      "Jangan menganggap actuator_controls sebagai data EMG atau bukti gerak otot dinamis."
+    ]
+  }
+}

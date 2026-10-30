@@ -15,8 +15,8 @@ Perbedaan utama dari versi sebelumnya:
   ikut berputar bersama tangan, sehingga rotasi RELATIF hand|forearm nyaris nol
   saat lengan bawah diputar; tanpa kanal twist ini pro_sup tidak dapat dibaca.
   Fleksi/deviasi tetap dari rotasi relatif, dan diselesaikan dengan pro_sup
-  yang sudah terkunci. Tanpa "forearm_twist", mapper kembali ke perilaku lama
-  (3 sendi dari rotasi relatif).
+  yang sudah terkunci. Tanpa "forearm_twist", sumbu diperkirakan dari
+  penyelarasan fleksi/deviasi dan pose netral HAND terhadap FOREARM.
 """
 
 import warnings
@@ -24,6 +24,7 @@ import warnings
 import mujoco
 import numpy as np
 
+from smartglove.config import WRIST_PRONATION_SIGN
 from smartglove.quaternion import (
     normalize_quaternion,
     quaternion_conjugate,
@@ -58,10 +59,15 @@ class WristQposMapper:
         axes_file=DEFAULT_AXES_FILE,
         sensor_axes: dict[str, np.ndarray] | None = None,
         gains: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        infer_forearm_twist: bool = True,
+        pronation_sign: float = WRIST_PRONATION_SIGN,
     ) -> None:
         self.model = model
         self.data = data
         self.quaternion_order = quaternion_order
+        if pronation_sign not in (-1.0, 1.0):
+            raise ValueError("pronation_sign harus -1 atau +1.")
+        self.pronation_sign = float(pronation_sign)
         self.gains = np.asarray(gains, dtype=float)
         if self.gains.shape != (3,) or not np.all(np.isfinite(self.gains)):
             raise ValueError("gains harus berisi tiga nilai finite.")
@@ -89,6 +95,8 @@ class WristQposMapper:
         self.alignment_source = "identity (belum dikalibrasi)"
         twist = (self._sensor_axes or {}).get("forearm_twist")
         self.twist_axis = None if twist is None else np.asarray(twist, dtype=float)
+        self.infer_forearm_twist = infer_forearm_twist
+        self.twist_source = "calibrated" if twist is not None else "unavailable"
         self.neutral_forearm: np.ndarray | None = None
         self.lunate_in_radius_neutral: np.ndarray | None = None
         self.neutral_relative: np.ndarray | None = None
@@ -134,6 +142,15 @@ class WristQposMapper:
         if self._sensor_axes and {"flexion", "deviation"} <= self._sensor_axes.keys():
             self.alignment = fit_alignment(self._sensor_axes, model_axes)
             self.alignment_source = "sapuan kalibrasi (wrist_axes.json)"
+            if self.infer_forearm_twist and self.twist_source != "calibrated":
+                # alignment.T: lunate -> sensor HAND saat netral.
+                # neutral_relative: sensor HAND -> sensor FOREARM saat netral.
+                # Sumbu model bertanda mempertahankan arah positif pro_sup;
+                # cross(flexion, deviation) saja dapat membalik arah putaran.
+                hand_axis = self.alignment.T @ model_axes["pro_sup"]
+                forearm_axis = quaternion_to_matrix(self.neutral_relative) @ hand_axis
+                self.twist_axis = forearm_axis / np.linalg.norm(forearm_axis)
+                self.twist_source = "estimated"
         else:
             self.alignment = np.eye(3)
             self.alignment_source = "identity (belum dikalibrasi)"
@@ -141,6 +158,13 @@ class WristQposMapper:
                 "Sumbu sensor wrist belum dikalibrasi: diasumsikan sama dengan "
                 "sumbu model. Jalankan tools/calibrate_wrist_axes.py agar derajat "
                 "gerak wrist sesuai.",
+                stacklevel=2,
+            )
+        if self.twist_axis is None:
+            warnings.warn(
+                "Sumbu forearm_twist belum tersedia: putaran bersama HAND/FOREARM "
+                "tidak terbaca. Kalibrasikan sumbu fleksi/deviasi atau --pronation "
+                "dengan tools/calibrate_wrist_axes.py.",
                 stacklevel=2,
             )
 
@@ -229,8 +253,12 @@ class WristQposMapper:
             quaternion_conjugate(self.neutral_forearm), normalize_quaternion(forearm)
         )
         neutral = self.neutral_qpos[self.qpos_ids]
-        pro_sup = neutral[0] + self.gains[0] * twist_angle(delta_forearm, self.twist_axis)
-        pro_sup = float(np.clip(pro_sup, self.lower[0], self.upper[0]))
+        requested_pro_sup = (
+            neutral[0]
+            + self.pronation_sign * self.gains[0]
+            * twist_angle(delta_forearm, self.twist_axis)
+        )
+        pro_sup = float(np.clip(requested_pro_sup, self.lower[0], self.upper[0]))
         self.data.qpos[self.qpos_ids[0]] = pro_sup
         mujoco.mj_forward(self.model, self.data)  # type: ignore[attr-defined]
         radius = normalize_quaternion(self.data.xquat[self.bodies["FOREARM"]])
@@ -245,4 +273,6 @@ class WristQposMapper:
         gains = self.gains.copy()
         gains[0] = 1.0
         scaled = neutral + gains * (solved - neutral)
+        # Simpan permintaan sebelum clamp agar indikator saturasi pro_sup benar.
+        scaled[0] = requested_pro_sup
         return np.clip(scaled, self.lower, self.upper), scaled

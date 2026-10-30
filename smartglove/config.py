@@ -2,6 +2,8 @@ ENV_NAME = "myoHandPoseFixed-v0"
 CALIBRATION_PACKETS = 30
 IK_ITERATIONS = 20
 FILTER_CUTOFF_HZ = 12.0
+# Arah putaran telapak, dikoreksi dari pengamatan glove terhadap viewer.
+WRIST_PRONATION_SIGN = -1.0
 # Couple the two flexion joints because one distal quaternion cannot resolve both.
 DISTAL_COUPLING = 2.0 / 3.0
 

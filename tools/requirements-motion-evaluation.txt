@@ -1,0 +1,3 @@
+ufbx==0.0.5
+matplotlib==3.11.2
+# Also requires existing project environment: numpy, scipy, mujoco, myosuite, gymnasium, pytest

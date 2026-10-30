@@ -1,0 +1,280 @@
+{
+  "geometric_bends": {
+    "INDEX": {
+      "reference": {
+        "p05_deg": [
+          7.567326707857452,
+          8.908731985279465,
+          5.938519698497247
+        ],
+        "p95_deg": [
+          76.9461086987799,
+          98.56511921894328,
+          66.6679205894499
+        ]
+      },
+      "mapped": {
+        "p05_deg": [
+          9.914683539774796,
+          7.607054494438895,
+          3.064874884372805
+        ],
+        "p95_deg": [
+          86.53273015247855,
+          97.46330611635369,
+          92.76140560905743
+        ]
+      }
+    },
+    "MIDDLE": {
+      "reference": {
+        "p05_deg": [
+          4.69911171485216,
+          14.880169889929572,
+          9.922162210858106
+        ],
+        "p95_deg": [
+          86.37819105474138,
+          103.32466022589371,
+          69.99412723564737
+        ]
+      },
+      "mapped": {
+        "p05_deg": [
+          7.933617315289367,
+          4.207361466484413,
+          7.602085656566573
+        ],
+        "p95_deg": [
+          86.43740610914104,
+          94.0659415307962,
+          96.53375334032067
+        ]
+      }
+    },
+    "RING": {
+      "reference": {
+        "p05_deg": [
+          6.517093685857021,
+          13.973337058129642,
+          9.31676552797687
+        ],
+        "p95_deg": [
+          89.17141492300665,
+          97.64170549255088,
+          66.02442057571488
+        ]
+      },
+      "mapped": {
+        "p05_deg": [
+          5.200411414659523,
+          0.6948649791611241,
+          2.8619625997188076
+        ],
+        "p95_deg": [
+          87.85125772749974,
+          90.13397943575217,
+          89.6231687511063
+        ]
+      }
+    },
+    "PINKY": {
+      "reference": {
+        "p05_deg": [
+          1.4775589227686288,
+          6.709396054628072,
+          4.473702406539737
+        ],
+        "p95_deg": [
+          83.67141848732575,
+          94.67666278030002,
+          63.96410249908182
+        ]
+      },
+      "mapped": {
+        "p05_deg": [
+          2.050920186113499,
+          1.6442401435231044,
+          5.922099359171775
+        ],
+        "p95_deg": [
+          85.84608262615441,
+          89.9194838415737,
+          95.71724299010306
+        ]
+      }
+    }
+  },
+  "wrist": {
+    "reference": {
+      "hand_relative_forearm": {
+        "p95_excursion_from_first_deg": 20.091699362437584,
+        "max_excursion_from_first_deg": 21.517499568456234
+      },
+      "forearm_world": {
+        "p95_excursion_from_first_deg": 130.9843427743878,
+        "max_excursion_from_first_deg": 131.70744584116198
+      }
+    },
+    "mapped": {
+      "hand_relative_forearm": {
+        "p95_excursion_from_first_deg": 8.802818640008667,
+        "max_excursion_from_first_deg": 10.10233725145942
+      },
+      "forearm_world": {
+        "p95_excursion_from_first_deg": 6.483690374160006,
+        "max_excursion_from_first_deg": 7.7453941706476535
+      }
+    }
+  },
+  "candidate_joint_limits": {
+    "pro_sup": {
+      "baseline_upper_fraction": 0.0,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.0,
+      "candidate_lower_fraction": 0.0
+    },
+    "deviation": {
+      "baseline_upper_fraction": 0.0,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.10583153347732181,
+      "candidate_lower_fraction": 0.10583153347732181
+    },
+    "flexion": {
+      "baseline_upper_fraction": 0.0,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.0,
+      "candidate_lower_fraction": 0.0
+    },
+    "cmc_abduction": {
+      "baseline_upper_fraction": 0.16414686825053995,
+      "candidate_upper_fraction": 0.16414686825053995,
+      "baseline_lower_fraction": 0.5334773218142549,
+      "candidate_lower_fraction": 0.5334773218142549
+    },
+    "cmc_flexion": {
+      "baseline_upper_fraction": 0.0,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.3023758099352052,
+      "candidate_lower_fraction": 0.3023758099352052
+    },
+    "mp_flexion": {
+      "baseline_upper_fraction": 0.0,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.3023758099352052,
+      "candidate_lower_fraction": 0.3023758099352052
+    },
+    "ip_flexion": {
+      "baseline_upper_fraction": 0.0,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.3023758099352052,
+      "candidate_lower_fraction": 0.3023758099352052
+    },
+    "mcp2_flexion": {
+      "baseline_upper_fraction": 0.31533477321814257,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.42548596112311016,
+      "candidate_lower_fraction": 0.42548596112311016
+    },
+    "mcp2_abduction": {
+      "baseline_upper_fraction": 0.4946004319654428,
+      "candidate_upper_fraction": 0.4946004319654428,
+      "baseline_lower_fraction": 0.06695464362850972,
+      "candidate_lower_fraction": 0.06695464362850972
+    },
+    "pm2_flexion": {
+      "baseline_upper_fraction": 0.31533477321814257,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.42548596112311016,
+      "candidate_lower_fraction": 0.42548596112311016
+    },
+    "md2_flexion": {
+      "baseline_upper_fraction": 0.31533477321814257,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.42548596112311016,
+      "candidate_lower_fraction": 0.42548596112311016
+    },
+    "mcp3_flexion": {
+      "baseline_upper_fraction": 0.183585313174946,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.42116630669546434,
+      "candidate_lower_fraction": 0.42116630669546434
+    },
+    "mcp3_abduction": {
+      "baseline_upper_fraction": 0.265658747300216,
+      "candidate_upper_fraction": 0.2678185745140389,
+      "baseline_lower_fraction": 0.5161987041036717,
+      "candidate_lower_fraction": 0.509719222462203
+    },
+    "pm3_flexion": {
+      "baseline_upper_fraction": 0.183585313174946,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.42116630669546434,
+      "candidate_lower_fraction": 0.42116630669546434
+    },
+    "md3_flexion": {
+      "baseline_upper_fraction": 0.183585313174946,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.42116630669546434,
+      "candidate_lower_fraction": 0.42116630669546434
+    },
+    "mcp4_flexion": {
+      "baseline_upper_fraction": 0.3282937365010799,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.4060475161987041,
+      "candidate_lower_fraction": 0.4060475161987041
+    },
+    "mcp4_abduction": {
+      "baseline_upper_fraction": 0.19438444924406048,
+      "candidate_upper_fraction": 0.19438444924406048,
+      "baseline_lower_fraction": 0.19870410367170627,
+      "candidate_lower_fraction": 0.17278617710583152
+    },
+    "pm4_flexion": {
+      "baseline_upper_fraction": 0.3282937365010799,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.4060475161987041,
+      "candidate_lower_fraction": 0.4060475161987041
+    },
+    "md4_flexion": {
+      "baseline_upper_fraction": 0.3282937365010799,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.4060475161987041,
+      "candidate_lower_fraction": 0.4060475161987041
+    },
+    "mcp5_flexion": {
+      "baseline_upper_fraction": 0.3174946004319654,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.38660907127429806,
+      "candidate_lower_fraction": 0.38660907127429806
+    },
+    "mcp5_abduction": {
+      "baseline_upper_fraction": 0.0,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.5680345572354212,
+      "candidate_lower_fraction": 0.5680345572354212
+    },
+    "pm5_flexion": {
+      "baseline_upper_fraction": 0.3174946004319654,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.38660907127429806,
+      "candidate_lower_fraction": 0.38660907127429806
+    },
+    "md5_flexion": {
+      "baseline_upper_fraction": 0.3174946004319654,
+      "candidate_upper_fraction": 0.0,
+      "baseline_lower_fraction": 0.38660907127429806,
+      "candidate_lower_fraction": 0.38660907127429806
+    }
+  },
+  "wrist_caution": "Excursions relative to each session first sample; these are not aligned anatomical angular errors. World forearm includes whole-arm motion. FBX first pose is not verified handshake neutral.",
+  "fbx_fk_scene_validation": {
+    "sample_indices": [
+      0,
+      30,
+      347,
+      693
+    ],
+    "max_matrix_error": 7.105427357601002e-14
+  }
+}

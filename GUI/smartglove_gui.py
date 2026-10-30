@@ -96,6 +96,7 @@ class SmartGloveGUI:
         self.packet_var = tk.StringVar(value="Packets: 0")
         self.source_var = tk.StringVar(value="None")
         self.qpos_var = tk.StringVar(value="Waiting for glove frames")
+        self.wrist_var = tk.StringVar(value="Waiting for wrist calibration")
         self.recording_var = tk.StringVar(value="Not recording")
         self.guidance_var = tk.StringVar(
             value="Connect to open the model and listen for glove data."
@@ -285,6 +286,7 @@ class SmartGloveGUI:
         self._status_row(panel, "Packets", self.packet_var)
         self._status_row(panel, "Glove source", self.source_var)
         self._status_row(panel, "Calibration", self.qpos_var)
+        self._status_row(panel, "Wrist (deg)", self.wrist_var)
         self._status_row(panel, "Recording", self.recording_var)
 
         ttk.Separator(panel).pack(fill="x", pady=8)
@@ -509,6 +511,7 @@ class SmartGloveGUI:
         )
         self.source_var.set("None")
         self.qpos_var.set("Waiting for glove frames")
+        self.wrist_var.set("Waiting for wrist calibration")
         self.guidance_var.set(
             "Connect to open the model and listen for glove data."
         )
@@ -862,6 +865,21 @@ class SmartGloveGUI:
             raise RuntimeError("Mapper pergelangan belum siap.")
         # Wrist lebih dulu agar IK jari memakai pose wrist frame yang sama.
         self.wrist_mapper.map_frame(filtered)
+        wrist_text = " / ".join(
+            f"{name} {angle:+.0f}{'*' if saturated else ''}"
+            for name, angle, saturated in zip(
+                ("PS", "Dev", "Flex"),
+                self.wrist_mapper.last_angles_deg,
+                self.wrist_mapper.saturated,
+            )
+        )
+        if self.wrist_mapper.twist_axis is None:
+            wrist_text += " | PS uncalibrated"
+        elif self.wrist_mapper.twist_source == "estimated":
+            wrist_text += " | PS estimated"
+        if self.wrist_mapper.saturated.any():
+            wrist_text += " | * ROM limit"
+        self.wrist_var.set(wrist_text)
         qpos = self.mapper.map_frame(finger_quaternions)
         target_activations = self.muscle_controller.update(qpos)
         if self.fatigue_model is None:

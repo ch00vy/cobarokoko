@@ -1,0 +1,51 @@
+{
+  "recording_replay_max_abs_qpos_error": 0.0,
+  "candidate": "FBX geometric 5th-95th percentile flexion excursion per joint; thumb unchanged",
+  "endpoint_priors_deg": {
+    "INDEX": [
+      69.37878199092245,
+      89.6563872336638,
+      60.72940089095266
+    ],
+    "MIDDLE": [
+      81.67907933988921,
+      88.44449033596415,
+      60.07196502478926
+    ],
+    "RING": [
+      82.65432123714963,
+      83.66836843442124,
+      56.70765504773802
+    ],
+    "PINKY": [
+      82.19385956455713,
+      87.96726672567195,
+      59.490400092542075
+    ]
+  },
+  "comparison": {
+    "closing": {
+      "transitions": 4,
+      "rmse_hand_lengths": [
+        0.28960642369436407,
+        0.375077027252318,
+        0.38542848938827495,
+        0.36499459948535523,
+        0.3085093520030649
+      ]
+    },
+    "opening": {
+      "transitions": 4,
+      "rmse_hand_lengths": [
+        0.2701743700272773,
+        0.2191382575521558,
+        0.21309742496613648,
+        0.20130261326826837,
+        0.18131372488125472
+      ]
+    }
+  },
+  "warnings": [],
+  "alignment": "Frozen baseline transition windows for paired A/B evaluation; reference profiles fixed.",
+  "limitation": "Priors and evaluation use same Studio clip: descriptive development result, not held-out validation. MCP axes and anatomical models differ."
+}

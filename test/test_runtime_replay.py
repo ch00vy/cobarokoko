@@ -55,12 +55,22 @@ class LiveAndReplayTests(unittest.TestCase):
 
     # ------------------------------------------------------------- golden
 
-    def test_live_path_matches_golden_master(self) -> None:
+    def test_legacy_relative_mode_matches_golden_master(self) -> None:
         # Golden dibuat di Linux; di platform lain selisih ~1e-9 itu wajar.
         # Toleransi 1e-6 jauh di atas noise tapi jauh di bawah lompatan 1e-3.
+        # Golden mendahului estimasi twist: uji opsi kompatibilitas secara
+        # eksplisit; tes live/replay lain tetap memakai default baru.
+        mapper_type = runtime.WristQposMapper
+        with mock.patch.object(
+            runtime, "WristQposMapper",
+            side_effect=lambda *args, **kwargs: mapper_type(
+                *args, **kwargs, infer_forearm_twist=False
+            ),
+        ):
+            legacy_qpos = quiet(fakes.run_fake_live_session)
         golden = np.load(fakes.GOLDEN_PATH)["qpos"]
-        self.assertEqual(self.live_qpos.shape, golden.shape)
-        np.testing.assert_allclose(self.live_qpos, golden, rtol=0, atol=1e-6)
+        self.assertEqual(legacy_qpos.shape, golden.shape)
+        np.testing.assert_allclose(legacy_qpos, golden, rtol=0, atol=1e-6)
 
     # ------------------------------------------------------------ rekaman
 

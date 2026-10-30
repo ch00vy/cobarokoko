@@ -1,0 +1,488 @@
+{
+  "counts": {
+    "raw": 523,
+    "mapped": 463,
+    "reference": 694
+  },
+  "params": {
+    "env": "myoHandPoseFixed-v0",
+    "flexion_gain": 1.0,
+    "filter_cutoff_hz": 12.0,
+    "calibration_packets": 30,
+    "ik_iterations": 20,
+    "distal_coupling": 0.6666666666666666
+  },
+  "mapping_dt_seconds": {
+    "median": 0.05836200000000069,
+    "max": 0.1229180000000003
+  },
+  "qpos_joint_order": {
+    "pro_sup": 0,
+    "deviation": 1,
+    "flexion": 2,
+    "cmc_abduction": 3,
+    "cmc_flexion": 4,
+    "mp_flexion": 5,
+    "ip_flexion": 6,
+    "mcp2_flexion": 7,
+    "mcp2_abduction": 8,
+    "pm2_flexion": 9,
+    "md2_flexion": 10,
+    "mcp3_flexion": 11,
+    "mcp3_abduction": 12,
+    "pm3_flexion": 13,
+    "md3_flexion": 14,
+    "mcp4_flexion": 15,
+    "mcp4_abduction": 16,
+    "pm4_flexion": 17,
+    "md4_flexion": 18,
+    "mcp5_flexion": 19,
+    "mcp5_abduction": 20,
+    "pm5_flexion": 21,
+    "md5_flexion": 22
+  },
+  "joints": {
+    "pro_sup": {
+      "rom_deg": 7.745394170647682,
+      "limit_fraction": 0.0,
+      "lower_fraction": 0.0,
+      "upper_fraction": 0.0,
+      "velocity_rms_deg_s": 5.509837084417342
+    },
+    "deviation": {
+      "rom_deg": 10.209554569409576,
+      "limit_fraction": 0.10583153347732181,
+      "lower_fraction": 0.10583153347732181,
+      "upper_fraction": 0.0,
+      "velocity_rms_deg_s": 4.48397292861112
+    },
+    "flexion": {
+      "rom_deg": 7.962599582694597,
+      "limit_fraction": 0.0,
+      "lower_fraction": 0.0,
+      "upper_fraction": 0.0,
+      "velocity_rms_deg_s": 5.006583701723847
+    },
+    "cmc_abduction": {
+      "rom_deg": 73.33859777674537,
+      "limit_fraction": 0.6976241900647948,
+      "lower_fraction": 0.5334773218142549,
+      "upper_fraction": 0.16414686825053995,
+      "velocity_rms_deg_s": 94.31004209102558
+    },
+    "cmc_flexion": {
+      "rom_deg": 44.69070802020421,
+      "limit_fraction": 0.3023758099352052,
+      "lower_fraction": 0.3023758099352052,
+      "upper_fraction": 0.0,
+      "velocity_rms_deg_s": 34.548275042599755
+    },
+    "mp_flexion": {
+      "rom_deg": 44.99999063801583,
+      "limit_fraction": 0.3023758099352052,
+      "lower_fraction": 0.3023758099352052,
+      "upper_fraction": 0.0,
+      "velocity_rms_deg_s": 34.78736682295867
+    },
+    "ip_flexion": {
+      "rom_deg": 75.00017538262476,
+      "limit_fraction": 0.3023758099352052,
+      "lower_fraction": 0.3023758099352052,
+      "upper_fraction": 0.0,
+      "velocity_rms_deg_s": 57.97909234713215
+    },
+    "mcp2_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.7408207343412527,
+      "lower_fraction": 0.42548596112311016,
+      "upper_fraction": 0.31533477321814257,
+      "velocity_rms_deg_s": 74.26689910901082
+    },
+    "mcp2_abduction": {
+      "rom_deg": 29.99995556149088,
+      "limit_fraction": 0.5615550755939525,
+      "lower_fraction": 0.06695464362850972,
+      "upper_fraction": 0.4946004319654428,
+      "velocity_rms_deg_s": 19.76575263776799
+    },
+    "pm2_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.7408207343412527,
+      "lower_fraction": 0.42548596112311016,
+      "upper_fraction": 0.31533477321814257,
+      "velocity_rms_deg_s": 74.26689910901082
+    },
+    "md2_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.7408207343412527,
+      "lower_fraction": 0.42548596112311016,
+      "upper_fraction": 0.31533477321814257,
+      "velocity_rms_deg_s": 74.26689910901082
+    },
+    "mcp3_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.6047516198704104,
+      "lower_fraction": 0.42116630669546434,
+      "upper_fraction": 0.183585313174946,
+      "velocity_rms_deg_s": 72.11707900502525
+    },
+    "mcp3_abduction": {
+      "rom_deg": 29.99995556149088,
+      "limit_fraction": 0.7818574514038877,
+      "lower_fraction": 0.5161987041036717,
+      "upper_fraction": 0.265658747300216,
+      "velocity_rms_deg_s": 75.40394747339923
+    },
+    "pm3_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.6047516198704104,
+      "lower_fraction": 0.42116630669546434,
+      "upper_fraction": 0.183585313174946,
+      "velocity_rms_deg_s": 72.11707900502525
+    },
+    "md3_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.6047516198704104,
+      "lower_fraction": 0.42116630669546434,
+      "upper_fraction": 0.183585313174946,
+      "velocity_rms_deg_s": 72.11707900502525
+    },
+    "mcp4_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.734341252699784,
+      "lower_fraction": 0.4060475161987041,
+      "upper_fraction": 0.3282937365010799,
+      "velocity_rms_deg_s": 70.83677100348346
+    },
+    "mcp4_abduction": {
+      "rom_deg": 29.99995556149088,
+      "limit_fraction": 0.3930885529157667,
+      "lower_fraction": 0.19870410367170627,
+      "upper_fraction": 0.19438444924406048,
+      "velocity_rms_deg_s": 121.89275118996635
+    },
+    "pm4_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.734341252699784,
+      "lower_fraction": 0.4060475161987041,
+      "upper_fraction": 0.3282937365010799,
+      "velocity_rms_deg_s": 70.83677100348346
+    },
+    "md4_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.734341252699784,
+      "lower_fraction": 0.4060475161987041,
+      "upper_fraction": 0.3282937365010799,
+      "velocity_rms_deg_s": 70.83677100348346
+    },
+    "mcp5_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.7041036717062635,
+      "lower_fraction": 0.38660907127429806,
+      "upper_fraction": 0.3174946004319654,
+      "velocity_rms_deg_s": 69.75252538819579
+    },
+    "mcp5_abduction": {
+      "rom_deg": 28.02839973194213,
+      "limit_fraction": 0.5680345572354212,
+      "lower_fraction": 0.5680345572354212,
+      "upper_fraction": 0.0,
+      "velocity_rms_deg_s": 43.92753508461925
+    },
+    "pm5_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.7041036717062635,
+      "lower_fraction": 0.38660907127429806,
+      "upper_fraction": 0.3174946004319654,
+      "velocity_rms_deg_s": 69.75252538819579
+    },
+    "md5_flexion": {
+      "rom_deg": 90.00021045914971,
+      "limit_fraction": 0.7041036717062635,
+      "lower_fraction": 0.38660907127429806,
+      "upper_fraction": 0.3174946004319654,
+      "velocity_rms_deg_s": 69.75252538819579
+    }
+  },
+  "coupling": {
+    "THUMB": {
+      "flexion_variance_first_component": 1.0
+    },
+    "INDEX": {
+      "flexion_variance_first_component": 1.0
+    },
+    "MIDDLE": {
+      "flexion_variance_first_component": 1.0
+    },
+    "RING": {
+      "flexion_variance_first_component": 1.0
+    },
+    "PINKY": {
+      "flexion_variance_first_component": 1.0
+    }
+  },
+  "alignment": "Separate opening/closing transitions between prominent extrema; resample each transition to 101 elapsed-phase points; no absolute frame pairing.",
+  "normalization": "Right-handed geometric palm basis; wrist origin, middle MCP distance scale. FBX cm to m. Thumb bases differ anatomically; thumb distance is exploratory.",
+  "comparison": {
+    "closing": {
+      "reference_transitions": 4,
+      "mapped_transitions": 4,
+      "distance_profile_rmse_hand_lengths": [
+        0.28960642369436407,
+        0.38795090587068853,
+        0.3998892432759105,
+        0.37968557627083377,
+        0.3216823591981852
+      ]
+    },
+    "opening": {
+      "reference_transitions": 5,
+      "mapped_transitions": 4,
+      "distance_profile_rmse_hand_lengths": [
+        0.27017437002727723,
+        0.262263260663923,
+        0.2355843088883096,
+        0.22704833872686586,
+        0.20200293180994405
+      ]
+    }
+  },
+  "mapped_segments": [
+    {
+      "start": 53,
+      "end": 67,
+      "phase": "closing"
+    },
+    {
+      "start": 67,
+      "end": 146,
+      "phase": "opening"
+    },
+    {
+      "start": 146,
+      "end": 186,
+      "phase": "closing"
+    },
+    {
+      "start": 186,
+      "end": 223,
+      "phase": "opening"
+    },
+    {
+      "start": 223,
+      "end": 261,
+      "phase": "closing"
+    },
+    {
+      "start": 261,
+      "end": 270,
+      "phase": "opening"
+    },
+    {
+      "start": 270,
+      "end": 359,
+      "phase": "closing"
+    },
+    {
+      "start": 359,
+      "end": 370,
+      "phase": "opening"
+    }
+  ],
+  "reference_segments": [
+    {
+      "start": 3,
+      "end": 77,
+      "phase": "opening"
+    },
+    {
+      "start": 77,
+      "end": 175,
+      "phase": "closing"
+    },
+    {
+      "start": 175,
+      "end": 210,
+      "phase": "opening"
+    },
+    {
+      "start": 210,
+      "end": 301,
+      "phase": "closing"
+    },
+    {
+      "start": 301,
+      "end": 335,
+      "phase": "opening"
+    },
+    {
+      "start": 335,
+      "end": 425,
+      "phase": "closing"
+    },
+    {
+      "start": 425,
+      "end": 456,
+      "phase": "opening"
+    },
+    {
+      "start": 456,
+      "end": 546,
+      "phase": "closing"
+    },
+    {
+      "start": 546,
+      "end": 580,
+      "phase": "opening"
+    }
+  ],
+  "limitations": [
+    "Different sessions: profile RMSE is descriptive, not ground-truth tracking error.",
+    "Phase averaging does not measure live lag.",
+    "No actual dynamic state/EMG in recording.",
+    "No anatomical angle equality inferred from FBX local Euler axes."
+  ],
+  "source_sha256": {
+    "recordings\\uji2.jsonl": "85f98ddd00ed865823346e2b1b742f81fdb7e7491e2323e320c08198c79239ca",
+    "studio\\Clip_3.fbx": "cc438f563468827d000a8e782cb161577492369e33a4923391cacf2955a41f97"
+  },
+  "validation": {
+    "missing_mapping_frame_numbers": [
+      523
+    ],
+    "raw_quaternion_max_norm_error": 2.220446049250313e-16,
+    "filtered_order": "wxyz (verified from runtime; meta quat_order applies to sensor samples)"
+  },
+  "filter": {
+    "raw_to_filtered": {
+      "THUMB": {
+        "median_geodesic_deg": 0.006761405181836612,
+        "p95_geodesic_deg": 0.15700483685457287
+      },
+      "INDEX": {
+        "median_geodesic_deg": 0.009221389050004896,
+        "p95_geodesic_deg": 0.32143756026928516
+      },
+      "MIDDLE": {
+        "median_geodesic_deg": 0.008256707875995669,
+        "p95_geodesic_deg": 0.30547757216974586
+      },
+      "RING": {
+        "median_geodesic_deg": 0.010198389070261073,
+        "p95_geodesic_deg": 0.30385952189758014
+      },
+      "PINKY": {
+        "median_geodesic_deg": 0.006585386758876672,
+        "p95_geodesic_deg": 0.3368037977842604
+      },
+      "FOREARM": {
+        "median_geodesic_deg": 0.0013702745191191237,
+        "p95_geodesic_deg": 0.013180433559002561
+      },
+      "HAND": {
+        "median_geodesic_deg": 0.0023603727078694995,
+        "p95_geodesic_deg": 0.026672682688743794
+      }
+    },
+    "median_update_weight": 0.9877274612033675,
+    "note": "Weight near one provides little smoothing at this processed sample rate. Geodesic difference is not an estimated delay."
+  },
+  "calibration": {
+    "calib_open_done": {
+      "max_sample_deviation_deg": {
+        "THUMB": 0.07328454027783379,
+        "INDEX": 0.05891582461026062,
+        "MIDDLE": 0.06333079750964382,
+        "RING": 0.059361853673639615,
+        "PINKY": 0.10910242663333954,
+        "FOREARM": 0.06710785946297526,
+        "HAND": 0.038250783770523274
+      }
+    },
+    "calib_grip_done": {
+      "max_sample_deviation_deg": {
+        "THUMB": 0.03425186488236005,
+        "INDEX": 0.03566633649055774,
+        "MIDDLE": 0.03411587313023313,
+        "RING": 0.03011085737832858,
+        "PINKY": 0.036844476818425835
+      }
+    }
+  },
+  "velocity_rms_rad_per_s_power_1": [
+    0.08008799980035129,
+    0.0748349516032509,
+    0.08350616361748124,
+    1.2729677603657927,
+    0.5692660809172689,
+    0.5732056941285404,
+    0.9553452563085965,
+    1.303867583236927,
+    0.26731850884565833,
+    1.303867583236927,
+    1.303867583236927,
+    1.2593237647651343,
+    0.6296854182264273,
+    1.2593237647651343,
+    1.2593237647651343,
+    1.2421781550479256,
+    0.8400700111379353,
+    1.2421781550479256,
+    1.2421781550479256,
+    1.2253967058971797,
+    0.5483888252498378,
+    1.2253967058971797,
+    1.2253967058971797
+  ],
+  "acceleration_rms_rad_per_s_power_2": [
+    0.7863902568723038,
+    0.48048927798298374,
+    0.6283182864761593,
+    11.897700422041122,
+    2.6384842642156046,
+    2.6567439283928302,
+    4.427917822895162,
+    6.089993464866384,
+    3.01996631425542,
+    6.089993464866384,
+    6.089993464866384,
+    5.808112796522515,
+    6.489172048388042,
+    5.808112796522515,
+    5.808112796522515,
+    5.441643074903879,
+    9.635696501830903,
+    5.441643074903879,
+    5.441643074903879,
+    5.323185049082598,
+    5.541824817201275,
+    5.323185049082598,
+    5.323185049082598
+  ],
+  "jerk_rms_rad_per_s_power_3": [
+    10.507648821943846,
+    5.625518937419202,
+    8.260245256010704,
+    164.8967513980104,
+    26.660818778126224,
+    26.84532531628562,
+    44.742322795599016,
+    52.76404273599993,
+    43.93689242795735,
+    52.76404273599993,
+    52.76404273599993,
+    52.71013621319641,
+    96.34716374428704,
+    52.71013621319641,
+    52.71013621319641,
+    47.18269876502869,
+    142.47959406110547,
+    47.18269876502869,
+    47.18269876502869,
+    48.38122123606709,
+    78.31462751379476,
+    48.38122123606709,
+    48.38122123606709
+  ],
+  "derivative_caution": "Linear resampling to median-rate uniform grid then finite differences; jerk is noise-sensitive, no biomechanical optimality claim."
+}

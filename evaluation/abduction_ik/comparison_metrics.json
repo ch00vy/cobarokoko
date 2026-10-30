@@ -1,0 +1,149 @@
+{
+  "source_sha256": "85f98ddd00ed865823346e2b1b742f81fdb7e7491e2323e320c08198c79239ca",
+  "frames": 463,
+  "baseline_max_qpos_error": 0.0,
+  "fixed_flexion_wrist_max_error": 0.0,
+  "fingers": {
+    "THUMB": {
+      "baseline": {
+        "residual_mean_deg": 100.47033653064128,
+        "residual_p95_deg": 173.4088787399812,
+        "limit_fraction": 0.6976241900647948,
+        "abduction_velocity_rms_deg_s": 94.31004209102558
+      },
+      "candidate": {
+        "residual_mean_deg": 77.4016871801426,
+        "residual_p95_deg": 150.12085536891692,
+        "limit_fraction": 0.5680345572354212,
+        "abduction_velocity_rms_deg_s": 44.53594778840881
+      },
+      "overwrite": {
+        "mean_before_deg": 19.609224119088413,
+        "mean_after_deg": 100.47033653064128,
+        "mean_increase_deg": 80.86111241155287,
+        "worsened_fraction": 1.0
+      }
+    },
+    "INDEX": {
+      "baseline": {
+        "residual_mean_deg": 89.34190416122968,
+        "residual_p95_deg": 179.5049460462449,
+        "limit_fraction": 0.5615550755939525,
+        "abduction_velocity_rms_deg_s": 19.76575263776799
+      },
+      "candidate": {
+        "residual_mean_deg": 85.01018844992089,
+        "residual_p95_deg": 173.13532703938108,
+        "limit_fraction": 0.5334773218142549,
+        "abduction_velocity_rms_deg_s": 29.580612675779953
+      },
+      "overwrite": {
+        "mean_before_deg": 78.65579599827728,
+        "mean_after_deg": 89.34190416122968,
+        "mean_increase_deg": 10.68610816295238,
+        "worsened_fraction": 0.4557235421166307
+      }
+    },
+    "MIDDLE": {
+      "baseline": {
+        "residual_mean_deg": 87.58094590430287,
+        "residual_p95_deg": 179.93386060245768,
+        "limit_fraction": 0.7818574514038877,
+        "abduction_velocity_rms_deg_s": 75.40394747339923
+      },
+      "candidate": {
+        "residual_mean_deg": 79.13155292021398,
+        "residual_p95_deg": 160.75953286880628,
+        "limit_fraction": 0.7602591792656588,
+        "abduction_velocity_rms_deg_s": 76.3155946800839
+      },
+      "overwrite": {
+        "mean_before_deg": 54.37184687440384,
+        "mean_after_deg": 87.58094590430287,
+        "mean_increase_deg": 33.20909902989903,
+        "worsened_fraction": 0.8056155507559395
+      }
+    },
+    "RING": {
+      "baseline": {
+        "residual_mean_deg": 82.46139107571591,
+        "residual_p95_deg": 158.29976567575844,
+        "limit_fraction": 0.3930885529157667,
+        "abduction_velocity_rms_deg_s": 121.89275118996635
+      },
+      "candidate": {
+        "residual_mean_deg": 80.716357273738,
+        "residual_p95_deg": 154.755536893768,
+        "limit_fraction": 0.5356371490280778,
+        "abduction_velocity_rms_deg_s": 90.04586607332195
+      },
+      "overwrite": {
+        "mean_before_deg": 94.59889836731634,
+        "mean_after_deg": 82.46139107571591,
+        "mean_increase_deg": -12.137507291600445,
+        "worsened_fraction": 0.20734341252699784
+      }
+    },
+    "PINKY": {
+      "baseline": {
+        "residual_mean_deg": 80.91097673722382,
+        "residual_p95_deg": 151.9983818992501,
+        "limit_fraction": 0.5680345572354212,
+        "abduction_velocity_rms_deg_s": 43.927535084619244
+      },
+      "candidate": {
+        "residual_mean_deg": 80.36828742784732,
+        "residual_p95_deg": 151.9983818992501,
+        "limit_fraction": 0.5593952483801296,
+        "abduction_velocity_rms_deg_s": 22.488784535596757
+      },
+      "overwrite": {
+        "mean_before_deg": 63.22577758828624,
+        "mean_after_deg": 80.91097673722382,
+        "mean_increase_deg": 17.68519914893756,
+        "worsened_fraction": 0.9352051835853131
+      }
+    }
+  },
+  "phase_comparison": {
+    "baseline": {
+      "closing": [
+        0.28960642369436407,
+        0.38795090587068853,
+        0.39988924327591047,
+        0.3796855762708338,
+        0.3216823591981853
+      ],
+      "opening": [
+        0.2701743700272773,
+        0.262263260663923,
+        0.23558430888830958,
+        0.22704833872686583,
+        0.20200293180994405
+      ]
+    },
+    "candidate": {
+      "closing": [
+        0.1055764683666799,
+        0.3983691848858287,
+        0.4003785857415399,
+        0.37881694610149497,
+        0.3197022807297662
+      ],
+      "opening": [
+        0.06819912750416547,
+        0.28292323111081213,
+        0.23420577026611722,
+        0.22687983649712581,
+        0.20128208333856484
+      ]
+    }
+  },
+  "method": "Legacy IK initializes candidate; bounded scalar SO(3) optimization refines only abduction with final calibrated flexion fixed. Original pose included among candidates.",
+  "limitations": [
+    "Sensor orientation target remains world-based.",
+    "No temporal regularization; lower orientation residual does not ensure anatomical naturalness.",
+    "Different sessions; FBX profiles are descriptive, not ground truth.",
+    "Endpoint experiment is not combined with this candidate."
+  ]
+}
